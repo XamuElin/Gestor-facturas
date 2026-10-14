@@ -1,0 +1,10 @@
+{
+  "name": "Gestor de Facturas de Obra",
+  "description": "Automatización de subida de facturas a carpetas de Google Drive por proyecto de obra y registro en Google Sheets.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

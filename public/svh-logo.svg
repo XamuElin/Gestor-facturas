@@ -1,0 +1,12 @@
+<svg viewBox="0 0 500 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="15" width="145" height="315" rx="6" fill="#1ca330" />
+  <text x="87" y="230" text-anchor="middle" fill="#ffffff" font-family="'Playfair Display', Georgia, serif" font-size="155" font-weight="bold">S</text>
+  
+  <rect x="177" y="15" width="145" height="315" rx="6" fill="#98d52c" />
+  <text x="250" y="230" text-anchor="middle" fill="#ffffff" font-family="'Playfair Display', Georgia, serif" font-size="155" font-weight="bold">V</text>
+  
+  <rect x="340" y="15" width="145" height="315" rx="6" fill="#1ca330" />
+  <text x="412" y="230" text-anchor="middle" fill="#ffffff" font-family="'Playfair Display', Georgia, serif" font-size="155" font-weight="bold">H</text>
+  
+  <text x="250" y="395" text-anchor="middle" fill="#0f172a" font-family="'Playfair Display', Georgia, serif" font-size="41" font-weight="bold" letter-spacing="0.44em">ARQUITECTOS</text>
+</svg>

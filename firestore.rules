@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidProject(data, userId) {
+      return data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+        && data.userId == userId
+        && (!('baseFolderId' in data) || (data.baseFolderId is string && data.baseFolderId.size() <= 128))
+        && (!('baseFolderName' in data) || (data.baseFolderName is string && data.baseFolderName.size() <= 200))
+        && (!('baseLocationName' in data) || (data.baseLocationName is string && data.baseLocationName.size() <= 200))
+        && (!('webViewLink' in data) || (data.webViewLink is string && data.webViewLink.size() <= 500))
+        && (!('evidenceFolderId' in data) || (data.evidenceFolderId is string && data.evidenceFolderId.size() <= 128))
+        && (!('evidenceFolderName' in data) || (data.evidenceFolderName is string && data.evidenceFolderName.size() <= 200))
+        && (!('evidenceFolderUrl' in data) || (data.evidenceFolderUrl is string && data.evidenceFolderUrl.size() <= 500))
+        && (!('evidenceParentId' in data) || (data.evidenceParentId is string && data.evidenceParentId.size() <= 128))
+        && (!('evidenceParentName' in data) || (data.evidenceParentName is string && data.evidenceParentName.size() <= 200))
+        && (!('spreadsheetId' in data) || (data.spreadsheetId is string && data.spreadsheetId.size() <= 128))
+        && (!('spreadsheetName' in data) || (data.spreadsheetName is string && data.spreadsheetName.size() <= 200))
+        && (!('spreadsheetUrl' in data) || (data.spreadsheetUrl is string && data.spreadsheetUrl.size() <= 500))
+        && (!('spreadsheetParentId' in data) || (data.spreadsheetParentId is string && data.spreadsheetParentId.size() <= 128))
+        && (!('spreadsheetParentName' in data) || (data.spreadsheetParentName is string && data.spreadsheetParentName.size() <= 200));
+    }
+
+    match /users/{userId}/projects/{projectId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId)
+                    && isValidId(projectId)
+                    && isValidProject(request.resource.data, userId);
+      allow update: if isOwner(userId)
+                    && isValidId(projectId)
+                    && isValidProject(request.resource.data, userId)
+                    && request.resource.data.userId == resource.data.userId;
+      allow delete: if isOwner(userId) && isValidId(projectId);
+
+      // Subcollections of each obra (workers, facturas, bitacoras, nominas, inventario, abonos)
+      match /{allSubpaths=**} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+  }
+}

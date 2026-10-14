@@ -1,0 +1,305 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "Configuración y referencias de carpeta y hoja de cálculo de una obra de construcción.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identificador único de la obra (habitualmente ID de carpeta de Drive)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Nombre de la obra o proyecto de construcción"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID del usuario propietario en Firebase Auth"
+        },
+        "baseFolderId": {
+          "type": "string",
+          "description": "ID de la carpeta base del proyecto"
+        },
+        "baseFolderName": {
+          "type": "string",
+          "description": "Nombre de la carpeta base"
+        },
+        "baseLocationName": {
+          "type": "string",
+          "description": "Nombre descriptivo de la ubicación"
+        },
+        "webViewLink": {
+          "type": "string",
+          "description": "Enlace a Google Drive de la obra"
+        },
+        "evidenceFolderId": {
+          "type": "string",
+          "description": "ID de la carpeta de evidencias/facturas"
+        },
+        "evidenceFolderName": {
+          "type": "string",
+          "description": "Nombre de la carpeta de evidencias"
+        },
+        "evidenceFolderUrl": {
+          "type": "string",
+          "description": "URL de la carpeta de evidencias en Drive"
+        },
+        "evidenceParentId": {
+          "type": "string",
+          "description": "ID del contenedor de la carpeta de evidencias"
+        },
+        "evidenceParentName": {
+          "type": "string",
+          "description": "Nombre del contenedor de evidencias"
+        },
+        "spreadsheetId": {
+          "type": "string",
+          "description": "ID del Google Sheet de control de facturas"
+        },
+        "spreadsheetName": {
+          "type": "string",
+          "description": "Nombre del archivo de Google Sheets"
+        },
+        "spreadsheetUrl": {
+          "type": "string",
+          "description": "URL del Google Sheet"
+        },
+        "spreadsheetParentId": {
+          "type": "string",
+          "description": "ID del contenedor de la hoja de cálculo"
+        },
+        "spreadsheetParentName": {
+          "type": "string",
+          "description": "Nombre del contenedor de la hoja de cálculo"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha y hora de creación"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha y hora de última actualización"
+        }
+      },
+      "required": ["id", "name", "userId"]
+    },
+    "InvoiceJob": {
+      "title": "InvoiceJob",
+      "description": "Trabajo de procesamiento en segundo plano de factura con Gemini.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "ID del trabajo"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID del usuario propietario"
+        },
+        "projectId": {
+          "type": "string",
+          "description": "ID del proyecto o carpeta de obra"
+        },
+        "fileName": {
+          "type": "string",
+          "description": "Nombre original del archivo"
+        },
+        "fileSha256": {
+          "type": "string",
+          "description": "Hash SHA-256 del contenido para control anti-duplicados"
+        },
+        "fileSize": {
+          "type": "number",
+          "description": "Tamaño del archivo en bytes"
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "Tipo MIME del archivo"
+        },
+        "driveFileId": {
+          "type": "string",
+          "description": "ID del archivo almacenado en Google Drive"
+        },
+        "driveWebViewLink": {
+          "type": "string",
+          "description": "Enlace de visualización en Google Drive"
+        },
+        "targetFolderId": {
+          "type": "string",
+          "description": "ID de la carpeta destino de la obra"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["en_cola", "leyendo", "leida", "revisar", "error"],
+          "description": "Estado del flujo de procesamiento"
+        },
+        "confidence": {
+          "type": "string",
+          "description": "Nivel de confianza: alta, media o baja"
+        },
+        "retryCount": {
+          "type": "number",
+          "description": "Número de reintentos realizados"
+        },
+        "errorMessage": {
+          "type": "string",
+          "description": "Motivo del error si ocurrió alguno"
+        },
+        "isDuplicate": {
+          "type": "boolean",
+          "description": "Verdadero si el hash SHA-256 ya existía en la obra"
+        },
+        "isPossibleDuplicate": {
+          "type": "boolean",
+          "description": "Verdadero si coinciden proveedor, número y total"
+        },
+        "duplicateReason": {
+          "type": "string",
+          "description": "Detalle del duplicado detectado"
+        },
+        "extractedData": {
+          "type": "object",
+          "description": "Datos contables leídos por Gemini"
+        },
+        "sheetAppended": {
+          "type": "boolean",
+          "description": "Si ya se insertó en la hoja de cálculo"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha y hora de creación"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha y hora de última modificación"
+        }
+      },
+      "required": ["id", "userId", "projectId", "fileName", "status"]
+    },
+    "Worker": {
+      "title": "Worker",
+      "description": "Trabajador en el catálogo de personal de la obra",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "nombre": { "type": "string" },
+        "rol": { "type": "string", "enum": ["oficial", "ayudante", "cielo raso", "otro"] },
+        "fechaInicio": { "type": "string" },
+        "tipo": { "type": "string", "enum": ["con prestaciones", "independiente"] },
+        "salarioMensual": { "type": "number" },
+        "auxilioTransporte": { "type": "number" },
+        "descuentoSaludPension": { "type": "number" }
+      },
+      "required": ["id", "nombre", "rol", "tipo", "salarioMensual"]
+    },
+    "FacturaSismo": {
+      "title": "FacturaSismo",
+      "description": "Gasto o factura registrada en adecuaciones sismo",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "consecutivo": { "type": "number" },
+        "concepto": { "type": "string" },
+        "costo": { "type": "number" },
+        "fecha": { "type": "string" },
+        "observacion": { "type": "string" },
+        "estado": { "type": "string", "enum": ["por_revisar", "confirmada", "pagada", "falta_factura"] },
+        "driveFileUrl": { "type": "string" },
+        "fileName": { "type": "string" }
+      },
+      "required": ["id", "consecutivo", "concepto", "costo", "fecha"]
+    },
+    "Bitacora": {
+      "title": "Bitacora",
+      "description": "Bitácora periódica de mano de obra",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "titulo": { "type": "string" },
+        "fechaInicio": { "type": "string" },
+        "fechaFin": { "type": "string" },
+        "trabajadores": { "type": "array" }
+      },
+      "required": ["id", "titulo", "fechaInicio", "fechaFin"]
+    },
+    "Nomina": {
+      "title": "Nomina",
+      "description": "Planilla quincenal de nómina",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "titulo": { "type": "string" },
+        "periodo": { "type": "string" },
+        "trabajadores": { "type": "array" }
+      },
+      "required": ["id", "titulo", "periodo"]
+    },
+    "InventarioItem": {
+      "title": "InventarioItem",
+      "description": "Material o herramienta en inventario de obra",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "nombre": { "type": "string" },
+        "unidad": { "type": "string" },
+        "cantidad": { "type": "number" },
+        "fechaIngreso": { "type": "string" },
+        "observacion": { "type": "string" },
+        "facturaVinculada": { "type": "string" }
+      },
+      "required": ["id", "nombre", "unidad", "cantidad", "fechaIngreso"]
+    },
+    "AbonoItem": {
+      "title": "AbonoItem",
+      "description": "Abono de cliente recibido para la obra",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "consecutivo": { "type": "number" },
+        "item": { "type": "string" },
+        "costo": { "type": "number" },
+        "fecha": { "type": "string" }
+      },
+      "required": ["id", "consecutivo", "item", "costo", "fecha"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/projects/{projectId}": {
+      "schema": "Project",
+      "description": "Obras y proyectos configurados para el usuario autenticado."
+    },
+    "/users/{userId}/projects/{projectId}/invoiceJobs/{jobId}": {
+      "schema": "InvoiceJob",
+      "description": "Trabajos de lectura y procesamiento de facturas en segundo plano."
+    },
+    "/users/{userId}/projects/{projectId}/workers/{workerId}": {
+      "schema": "Worker",
+      "description": "Catálogo de trabajadores de la obra."
+    },
+    "/users/{userId}/projects/{projectId}/facturas/{facturaId}": {
+      "schema": "FacturaSismo",
+      "description": "Facturas y gastos de adecuaciones sismo."
+    },
+    "/users/{userId}/projects/{projectId}/bitacoras/{bitacoraId}": {
+      "schema": "Bitacora",
+      "description": "Bitácoras de mano de obra."
+    },
+    "/users/{userId}/projects/{projectId}/nominas/{nominaId}": {
+      "schema": "Nomina",
+      "description": "Nóminas quincenales de la obra."
+    },
+    "/users/{userId}/projects/{projectId}/inventario/{itemId}": {
+      "schema": "InventarioItem",
+      "description": "Ítems de inventario de obra."
+    },
+    "/users/{userId}/projects/{projectId}/abonos/{abonoId}": {
+      "schema": "AbonoItem",
+      "description": "Abonos y pagos de cliente."
+    }
+  }
+}
