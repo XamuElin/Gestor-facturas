@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+# Historial y archivos pendientes de la cola de facturas
+.data/
+# Configuración local de npm (rutas de caché de esta máquina)
+.npmrc

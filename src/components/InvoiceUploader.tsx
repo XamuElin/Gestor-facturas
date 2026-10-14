@@ -550,14 +550,7 @@ export const InvoiceUploader: React.FC<InvoiceUploaderProps> = ({
         );
       }
 
-      // Pausa entre archivos (1.5s) y entre lotes de 5 (10s) para evitar picos y errores 503/429
-      if (i < pendingItems.length - 1) {
-        if ((i + 1) % 5 === 0) {
-          await new Promise((r) => setTimeout(r, 10000));
-        } else {
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      }
+      // Sin pausas artificiales: el servidor ya reintenta con backoff ante 429/503 de Gemini
     }
 
     setIsProcessingBatch(false);

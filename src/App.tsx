@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { User } from 'firebase/auth';
 import { initAuth, googleSignIn, logout, switchGoogleAccount, addGoogleAccount } from './services/firebaseAuth';
 import {
@@ -461,6 +461,75 @@ export default function App() {
         ? prev.map((f) => (f.id === factura.id ? factura : f))
         : [...prev, factura];
       return updated.sort((a, b) => a.consecutivo - b.consecutivo);
+    });
+  };
+
+  // Copia siempre actualizada de la lista, para añadir varias facturas seguidas sin repetir consecutivos
+  const facturasSismoRef = useRef<FacturaSismoItem[]>(facturasSismo);
+  useEffect(() => {
+    facturasSismoRef.current = facturasSismo;
+  }, [facturasSismo]);
+  const addingReadInvoicesRef = useRef<Promise<void>>(Promise.resolve());
+
+  /**
+   * Lleva a la lista de facturas de la obra (la que se ve en la página) las facturas leídas por la IA
+   * en segundo plano (subida masiva o análisis de Drive). Es idempotente: no duplica si ya existen.
+   */
+  const addReadInvoicesToFacturas = (
+    list: Array<{
+      jobId?: string;
+      fileId?: string;
+      fileName: string;
+      driveUrl?: string;
+      concept?: string;
+      vendorName?: string;
+      total?: number;
+      date?: string;
+    }>
+  ) => {
+    const project = selectedProject;
+    if (!project || list.length === 0) return;
+    // Encadenar para que dos llamadas seguidas no asignen el mismo consecutivo
+    addingReadInvoicesRef.current = addingReadInvoicesRef.current.then(async () => {
+      const current = [...facturasSismoRef.current];
+      const norm = (v?: string) => String(v || '').trim().toLowerCase();
+      for (const inv of list) {
+        const exists = current.some(
+          (f) =>
+            (inv.jobId && f.origenJobId === inv.jobId) ||
+            (inv.fileId && f.facturaVinculada?.fileId === inv.fileId) ||
+            (inv.driveUrl && (f.facturaVinculada?.url === inv.driveUrl || f.facturaVinculada?.webViewLink === inv.driveUrl)) ||
+            (inv.fileName && norm(f.facturaVinculada?.fileName) === norm(inv.fileName))
+        );
+        if (exists) continue;
+        const item: FacturaSismoItem = {
+          id: `fac-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          consecutivo: current.reduce((max, f) => Math.max(max, f.consecutivo || 0), 0) + 1,
+          concepto: (inv.concept || inv.vendorName || inv.fileName).toUpperCase(),
+          costo: Number(inv.total) || 0,
+          fecha: inv.date || new Date().toISOString().split('T')[0],
+          observacion: 'POR REVISAR',
+          estado: 'por_revisar',
+          origen: 'ia',
+          origenJobId: inv.jobId,
+          facturaVinculada: {
+            fileId: inv.fileId,
+            fileName: inv.fileName,
+            url: inv.driveUrl,
+            webViewLink: inv.driveUrl,
+          },
+        };
+        try {
+          await saveFacturaSismoToDb(project.id, item);
+          current.push(item);
+          facturasSismoRef.current = current;
+          setFacturasSismo((prev) =>
+            prev.some((f) => f.id === item.id) ? prev : [...prev, item].sort((a, b) => a.consecutivo - b.consecutivo)
+          );
+        } catch (err) {
+          console.warn('No se pudo guardar la factura leída en la lista de la obra:', err);
+        }
+      }
     });
   };
 
@@ -2421,6 +2490,13 @@ export default function App() {
                 onSaveFactura={handleSaveFacturaSismo}
                 onDeleteFactura={handleDeleteFacturaSismo}
                 onOpenUploadScanModal={() => setIsUploadInvoicesModalOpen(true)}
+                onOpenDriveScanModal={() => {
+                  if (!token) {
+                    setGlobalError('Conecta tu cuenta de Google ("Renovar Conexión Google") para leer la carpeta de Drive de la obra.');
+                    return;
+                  }
+                  setIsDriveInvoiceSyncModalOpen(true);
+                }}
                 onAddToInventory={handleAddToInventory}
               />
             )}
@@ -2519,7 +2595,18 @@ export default function App() {
           accessToken={token}
           existingInvoices={projectInvoices}
           activeTab={dynamicAnalysis?.activeTab || selectedProject.activeSheetTab}
-          onSyncComplete={async (addedCount) => {
+          onSyncComplete={async (addedCount, addedInvoices = []) => {
+            addReadInvoicesToFacturas(
+              addedInvoices.map((a) => ({
+                fileId: a.fileId,
+                fileName: a.fileName,
+                driveUrl: a.driveUrl,
+                concept: a.concept,
+                vendorName: a.vendorName,
+                total: a.total,
+                date: a.date,
+              }))
+            );
             if (token && selectedProject.spreadsheetId) {
               await loadProjectInvoices(
                 token,
@@ -2552,7 +2639,22 @@ export default function App() {
           onClose={() => setIsUploadInvoicesModalOpen(false)}
           project={selectedProject}
           accessToken={token || undefined}
-          onInvoiceCompleted={() => {
+          onInvoiceCompleted={(readJobs) => {
+            addReadInvoicesToFacturas(
+              readJobs.map((j) => {
+                const d = j.extractedData || {};
+                return {
+                  jobId: j.id,
+                  fileId: j.driveFileId,
+                  fileName: j.fileName,
+                  driveUrl: j.driveWebViewLink,
+                  concept: d.concept || d.concepto_resumen || d.concepto,
+                  vendorName: d.vendorName || d.proveedor,
+                  total: Number(d.totalAmount ?? d.total) || 0,
+                  date: d.date || d.fecha,
+                };
+              })
+            );
             if (token && selectedProject.spreadsheetId) {
               loadProjectInvoices(
                 token,

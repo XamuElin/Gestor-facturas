@@ -40,12 +40,16 @@ import { checkInvoiceDuplicate } from '../utils/duplicateChecker';
 // ============================================================================
 // 1. CONFIGURACIÓN DE CONCURRENCIA, LOTES Y REINTENTOS (PERSONALIZABLE)
 // ============================================================================
-export const MAX_CONCURRENCY = 2; // Concurrencia máxima: 2 archivos en paralelo
+// El servidor ya reintenta con backoff (y respeta el retryDelay de Gemini), así que aquí no hay
+// pausas artificiales entre archivos ni lotes; solo un reintento extra si el servidor sigue saturado.
+// La cuota gratuita de Gemini permite pocas lecturas por minuto: el servidor regula el ritmo
+// y, si aun así se agota, aquí se espera y se reintenta en vez de marcar la factura como fallida.
+export const MAX_CONCURRENCY = 2; // Archivos en paralelo
 export const BATCH_SIZE = 5; // Divide los archivos en lotes de 5
-export const BASE_FILE_DELAY_MS = 1500; // Entre cada archivo espera 1.5 segundos
-export const BATCH_DELAY_MS = 10000; // Entre cada lote espera 10 segundos
-export const MAX_RETRIES = 4; // Reintentos máximos (4 veces)
-export const RETRY_DELAYS_MS = [3000, 6000, 12000, 24000]; // 3s, 6s, 12s, 24s
+export const BASE_FILE_DELAY_MS = 0; // Sin espera entre archivos
+export const BATCH_DELAY_MS = 0; // Sin espera entre lotes
+export const MAX_RETRIES = 3; // Reintentos extra desde el navegador
+export const RETRY_DELAYS_MS = [15000, 30000, 60000];
 export const BACKUP_MODEL = 'gemini-3.5-flash'; // Modelo alternativo de respaldo de alta fidelidad
 
 export type RowProcessingStatus = 'Pendiente' | 'Procesando' | 'Completada' | 'Fallida' | 'Reintentando';
@@ -111,6 +115,7 @@ export interface AddedInvoiceResult {
   vendorName: string;
   date: string;
   total: number;
+  concept?: string;
 }
 
 export interface SkippedDuplicateResult {
@@ -127,7 +132,7 @@ export interface DriveInvoicesSyncModalProps {
   accessToken: string;
   existingInvoices: SheetInvoiceRecord[];
   activeTab?: string;
-  onSyncComplete: (addedCount: number) => void;
+  onSyncComplete: (addedCount: number, addedInvoices?: AddedInvoiceResult[]) => void;
 }
 
 export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
@@ -455,6 +460,7 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
     reason?: string;
     addedInvoice?: AddedInvoiceResult;
     error?: string;
+    dailyQuota?: boolean;
   }> => {
     if (file.status === 'already_read' && !modelOverride) {
       updateFileRow(file.id, {
@@ -516,17 +522,38 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
             folderId: folderIdToScan,
             spreadsheetId: project.spreadsheetId,
             sheetName: activeTab || project.activeSheetTab || 'Facturas',
-            skipAppend: true,
+            // El servidor registra la fila (con detección de duplicados y una sola lectura de la hoja por lote)
+            skipAppend: !project.spreadsheetId,
             model: modelOverride,
           }),
         });
 
-        if (!res.ok || !res.data?.success || !res.data?.extracted) {
-          const msg = res.error || res.data?.error || `Error HTTP ${res.status}`;
-          throw new Error(msg);
+        if (res.status === 401 || res.data?.isAuthError) {
+          window.dispatchEvent(new CustomEvent('svh_google_auth_expired'));
+          throw new Error('Tu sesión de Google expiró. Pulsa "Renovar Conexión Google" y vuelve a intentarlo.');
+        }
+        // Cupo diario de Gemini agotado: reintentar hoy no sirve; la factura queda pendiente
+        if (res.data?.isDailyQuota) {
+          const quotaMsg = res.data.error || 'Se agotó el cupo diario gratuito de Gemini.';
+          updateFileRow(file.id, { rowStatus: 'Pendiente', errorMessage: quotaMsg, retryCount: attempts });
+          return { success: false, dailyQuota: true, error: quotaMsg };
+        }
+        if (!res.ok || !res.data?.success) {
+          const msg = res.data?.error || res.error || `Error HTTP ${res.status}`;
+          throw new Error(res.status === 429 ? `429 ${msg}` : msg);
         }
 
-        const extracted = res.data.extracted;
+        // El servidor ya detectó que estaba registrada (por archivo o por proveedor + número)
+        if (res.data.isDuplicate) {
+          updateFileRow(file.id, { rowStatus: 'Completada', errorMessage: undefined });
+          return {
+            success: true,
+            isDuplicate: true,
+            reason: res.data.message || 'Ya está registrada en Google Sheets',
+          };
+        }
+
+        const extracted = res.data.extracted || {};
         const invNum = (extracted.numeroFactura || extracted.invoiceNumber || '').trim();
         const vendor = (extracted.cliente || extracted.vendorName || '').trim();
         const totalAmount = Number(extracted.total || extracted.totalAmount || 0);
@@ -551,7 +578,8 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
             ? `${invNum.toLowerCase()}__${vendor.toLowerCase()}`
             : '';
 
-        if (dupCheck.isDuplicate || (duplicateKey && activeKnownKeys?.has(duplicateKey))) {
+        // Si el servidor ya escribió la fila, su detección de duplicados fue la que decidió
+        if (!res.data.sheetAppended && (dupCheck.isDuplicate || (duplicateKey && activeKnownKeys?.has(duplicateKey)))) {
           console.warn(`[Anti-Duplicado] Factura "${file.name}" omitida por duplicada.`);
           updateFileRow(file.id, {
             rowStatus: 'Completada',
@@ -565,32 +593,10 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
           };
         }
 
-        // Si es válida y única, registrarla en Google Sheets usando appendInvoiceToSheet
-        if (project.spreadsheetId) {
-          const invoicePayload: InvoiceData = {
-            date: (extracted.fecha || extracted.date || '').trim(),
-            invoiceNumber: invNum,
-            vendorName: vendor,
-            vendorTaxId: (extracted.nitRut || extracted.vendorTaxId || '').trim(),
-            concept: (extracted.concepto || extracted.concept || (extracted.items?.map((it: any) => it.descripcion || it.description).filter(Boolean).join(', ') || '')).trim(),
-            category: (extracted.categoria || extracted.category || '').trim(),
-            subtotal: Number(extracted.subtotal || 0),
-            taxRatePercent: Number(extracted.taxRatePercent || extracted.porcentajeIva || (extracted.subtotal && extracted.iva ? Math.round((extracted.iva / extracted.subtotal) * 100) : 0)),
-            taxAmount: Number(extracted.iva || extracted.taxAmount || 0),
-            totalAmount: totalAmount,
-            currency: (extracted.moneda || extracted.currency || 'COP').trim(),
-            items: extracted.items || [],
-          };
-
+        // Registrada por el servidor en la hoja de la obra
+        if (project.spreadsheetId && res.data.sheetAppended) {
           const driveUrl = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`;
-          await appendInvoiceToSheet(
-            accessToken,
-            project.spreadsheetId,
-            invoicePayload,
-            driveUrl,
-            file.name,
-            activeTab || project.activeSheetTab || 'Facturas'
-          );
+          const invoicePayload = { date: String(extracted.fecha || extracted.date || '').trim() };
 
           if (duplicateKey && activeKnownKeys) {
             activeKnownKeys.add(duplicateKey);
@@ -604,6 +610,7 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
             vendorName: vendor || 'Proveedor',
             date: invoicePayload.date || '',
             total: totalAmount,
+            concept: String(extracted.concept || extracted.concepto_resumen || extracted.concepto || '').trim(),
           };
 
           updateFileRow(file.id, {
@@ -642,7 +649,9 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
           rawMsg.includes('timeout') ||
           rawMsg.includes('timed out') ||
           rawMsg.includes('504');
-        const isRetryable = is503 || is429 || isTimeout || rawMsg.includes('fetch');
+        // Incluye las páginas de error del proxy de AI Studio ("se está iniciando", "alta demanda", 502)
+        const isProxyHiccup = /iniciando|alta demanda|límite de uso|saturad|HTTP 502|HTTP 0\b/i.test(rawMsg);
+        const isRetryable = is503 || is429 || isTimeout || isProxyHiccup || rawMsg.includes('fetch');
 
         // Si el error es 503 repetido, aumenta automáticamente la pausa entre archivos al doble
         if (is503) {
@@ -712,9 +721,11 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
     });
 
     let global503Count = 0;
+    // Si Gemini agota el cupo diario se detiene la cola: las demás quedan pendientes para después
+    let dailyQuotaMessage: string | null = null;
 
     // Procesar lote a lote (Lotes de 5 archivos)
-    for (let bIndex = 0; bIndex < totalBatches; bIndex++) {
+    for (let bIndex = 0; bIndex < totalBatches && !dailyQuotaMessage; bIndex++) {
       await checkPauseAsync();
 
       const batchStart = bIndex * BATCH_SIZE;
@@ -734,12 +745,13 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
       const concurrencyLimit = Math.min(MAX_CONCURRENCY, batchFiles.length);
 
       const workers = Array.from({ length: concurrencyLimit }, async () => {
-        while (fileIdxInBatch < batchFiles.length) {
+        while (fileIdxInBatch < batchFiles.length && !dailyQuotaMessage) {
           const curIdx = fileIdxInBatch++;
           const file = batchFiles[curIdx];
           if (!file) break;
 
           await checkPauseAsync();
+          if (dailyQuotaMessage) break;
 
           const result = await processSingleFileWithRetries(
             file,
@@ -755,6 +767,11 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
               }
             }
           );
+
+          if (result.dailyQuota) {
+            dailyQuotaMessage = result.error || 'Se agotó el cupo diario gratuito de Gemini.';
+            break;
+          }
 
           processedCount++;
           if (result.success) {
@@ -801,7 +818,7 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
       await Promise.all(workers);
 
       // Entre cada lote espera 10 segundos con aviso visible en pantalla
-      if (bIndex < totalBatches - 1) {
+      if (bIndex < totalBatches - 1 && !dailyQuotaMessage) {
         for (let sec = Math.round(BATCH_DELAY_MS / 1000); sec > 0; sec--) {
           await checkPauseAsync();
           setPauseCountdownText(`Pausa entre lotes: ${sec}s...`);
@@ -815,6 +832,14 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
     setBatchQueueProgress(null);
     setPauseCountdownText(null);
 
+    if (dailyQuotaMessage) {
+      const pendingLeft = totalFiles - processedCount;
+      setScanError(
+        `${dailyQuotaMessage} Quedan ${pendingLeft} factura(s) pendientes: vuelve a pulsar "Procesar" cuando se renueve el cupo y solo se leerán esas.`
+      );
+      errors.push({ fileName: `${pendingLeft} factura(s) pendientes`, error: dailyQuotaMessage });
+    }
+
     setCompletedSummary({
       totalAnalyzed: totalFiles,
       addedCount,
@@ -826,7 +851,7 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
     });
 
     if (addedCount > 0) {
-      onSyncComplete(addedCount);
+      onSyncComplete(addedCount, addedInvoices);
     }
   };
 
@@ -908,7 +933,7 @@ export const DriveInvoicesSyncModal: React.FC<DriveInvoicesSyncModalProps> = ({
               errors: prev.errors.filter((e) => e.fileName !== file.name),
             };
           });
-          onSyncComplete(1);
+          onSyncComplete(1, [res.addedInvoice]);
         }
       }
     } finally {

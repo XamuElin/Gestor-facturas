@@ -28,7 +28,6 @@ import {
   groupBitacorasByMonth,
   calculateTotalObra,
   calculateTotalAbonos,
-  calculateSaldoObra,
   countFacturasFaltantes,
   countFacturasPorRevisar,
   calculateMonthlyComparison,
@@ -77,10 +76,6 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
 
   const totalAbonos = useMemo(() => calculateTotalAbonos(abonos), [abonos]);
 
-  const saldoObra = useMemo(
-    () => calculateSaldoObra(totalAbonos, totalObra),
-    [totalAbonos, totalObra]
-  );
 
   const totalNominas = useMemo(
     () => nominas.reduce((acc, n) => acc + (Number(n.total) || 0), 0),
@@ -155,8 +150,8 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         </div>
       </div>
 
-      {/* 2. Tarjetas Principales del Cuadro de Costos (5 Indicadores Clave) */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3 sm:gap-4">
+      {/* 2. Tarjetas Principales del Cuadro de Costos (4 Indicadores Clave) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         {/* Tarjeta 1: SUBTOTAL MATERIALES */}
         <div
           onClick={() => onNavigateToSection('facturas')}
@@ -244,40 +239,6 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             <span className="text-[#0F766E] font-bold group-hover:underline flex items-center gap-0.5">
               Ver <ArrowRight className="w-3 h-3" />
             </span>
-          </div>
-        </div>
-
-        {/* Tarjeta 5: SALDO = Abonos - Total Obra */}
-        <div
-          className={`p-4 sm:p-5 rounded-[14px] border shadow-2xs flex flex-col justify-between ${
-            saldoObra >= 0
-              ? 'bg-emerald-50/70 border-emerald-200/90 text-emerald-950'
-              : 'bg-rose-50/70 border-rose-200/90 text-rose-950'
-          }`}
-        >
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
-              Saldo Disponible
-            </span>
-            <span
-              className={`text-[9px] px-2 py-0.5 rounded-full font-bold ${
-                saldoObra >= 0
-                  ? 'bg-emerald-200 text-emerald-900'
-                  : 'bg-rose-200 text-rose-900'
-              }`}
-            >
-              {saldoObra >= 0 ? 'A favor' : 'Déficit'}
-            </span>
-          </div>
-          <div
-            className={`text-xl sm:text-2xl font-black font-mono tracking-tight tabular-nums ${
-              saldoObra >= 0 ? 'text-emerald-700' : 'text-rose-700'
-            }`}
-          >
-            {formatCOP(saldoObra)}
-          </div>
-          <div className="mt-2 text-[10px] text-slate-500">
-            Abonos − Total Obra
           </div>
         </div>
       </div>

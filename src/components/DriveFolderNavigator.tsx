@@ -245,9 +245,12 @@ export const DriveFolderNavigator: React.FC<DriveFolderNavigatorProps> = ({
     setShowBatchModal(true);
 
     // 1. Identificar comprobantes candidatos actualmente listados en la carpeta
+    // Las hojas de Google (registro de la obra, exportaciones) no son comprobantes
     const invoiceFiles = items.filter(
       (f) =>
         f.itemType !== 'folder' &&
+        f.mimeType !== 'application/vnd.google-apps.spreadsheet' &&
+        f.mimeType !== 'application/vnd.google-apps.folder' &&
         (f.itemType === 'invoice' ||
           f.itemType === 'sheet' ||
           f.mimeType === 'application/pdf' ||
@@ -255,182 +258,147 @@ export const DriveFolderNavigator: React.FC<DriveFolderNavigatorProps> = ({
           f.name.match(/\.(pdf|png|jpe?g|webp|xlsx?|csv)$/i))
     );
 
-    // Si tenemos archivos en la lista, los procesamos secuencialmente con /api/process-drive-file
-    // Esto proporciona progreso interactivo en tiempo real y elimina al 100% cualquier riesgo de Gateway Timeout (504)
+    // Procesar los comprobantes listados con /api/process-drive-file, varios a la vez.
+    // El servidor ya reintenta ante saturación de Gemini; aquí solo se reintenta una vez más si sigue saturado.
     if (invoiceFiles.length > 0) {
-      const results: any[] = [];
-      let successCount = 0;
-      let failureCount = 0;
-      let resolvedSpreadsheetUrl: string | undefined;
-
       const total = invoiceFiles.length;
-      setBatchProgress({
-        current: 0,
-        total,
-        currentFileName: invoiceFiles[0].name,
-        percentage: 0,
-      });
+      const results: any[] = new Array(total);
+      let completed = 0;
+      let resolvedSpreadsheetUrl: string | undefined;
+      let authExpired = false;
+      let dailyQuotaMessage: string | null = null;
+      const CONCURRENCY = 2;
 
-      try {
-        let fileDelayMs = 1500;
-        let consecutive503Count = 0;
+      setBatchProgress({ current: 0, total, currentFileName: invoiceFiles[0].name, percentage: 0 });
 
-        for (let i = 0; i < total; i++) {
-          const file = invoiceFiles[i];
-          const batchIndex = Math.floor(i / 5) + 1;
-          const totalBatches = Math.ceil(total / 5);
-
-          setBatchProgress({
-            current: i + 1,
-            total,
-            currentFileName: `Lote ${batchIndex} de ${totalBatches} · ${file.name}`,
-            percentage: Math.round(((i + 1) / total) * 100),
+      const processOne = async (file: any) => {
+        let singleRes: any = null;
+        for (let attempt = 0; attempt < 4 && !authExpired; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 15000 * attempt));
+          singleRes = await safeJsonFetch('/api/process-drive-file', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${currentAccessToken}`,
+            },
+            body: JSON.stringify({
+              fileId: file.id,
+              fileName: file.name,
+              mimeType: file.mimeType,
+              folderId: currentFolderId,
+            }),
           });
-
-          // Reintentos automáticos de hasta 4 veces con backoff creciente (3s, 6s, 12s, 24s + jitter)
-          let attempts = 0;
-          const MAX_RETRIES = 4;
-          const RETRY_DELAYS = [3000, 6000, 12000, 24000];
-          let singleRes: any = null;
-
-          while (attempts <= MAX_RETRIES) {
-            if (attempts > 0) {
-              const baseDelay = RETRY_DELAYS[attempts - 1] || 24000;
-              const jitter = Math.floor(Math.random() * 1000);
-              setBatchProgress((prev) =>
-                prev ? { ...prev, currentFileName: `Reintentando (${attempts}/${MAX_RETRIES}): ${file.name}` } : null
-              );
-              await new Promise((r) => setTimeout(r, baseDelay + jitter));
-            }
-
-            singleRes = await safeJsonFetch('/api/process-drive-file', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${currentAccessToken}`,
-              },
-              body: JSON.stringify({
-                fileId: file.id,
-                fileName: file.name,
-                mimeType: file.mimeType,
-                folderId: currentFolderId,
-              }),
-            });
-
-            if (singleRes.ok && singleRes.data?.success) {
-              consecutive503Count = 0;
-              break;
-            }
-
-            const errStr = (singleRes.error || singleRes.data?.error || '').toLowerCase();
-            const isAuth =
-              singleRes.status === 401 ||
-              singleRes.data?.isAuthError ||
-              errStr.includes('invalid authentication credentials') ||
-              errStr.includes('expected oauth 2') ||
-              errStr.includes('unauthenticated') ||
-              errStr.includes('expirado') ||
-              errStr.includes('sesión con google');
-
-            // Detener el procesamiento inmediatamente si la sesión expiró (no hacer retries inútiles)
-            if (isAuth) {
-              window.dispatchEvent(new CustomEvent('svh_google_auth_expired'));
-              setBatchError(
-                'Tu sesión con Google Drive y Google Sheets ha expirado. Por favor, pulsa en "Renovar Conexión Google" para continuar sin perder tu progreso.'
-              );
-              setIsBatchProcessing(false);
-              setBatchProgress(null);
-              return;
-            }
-
-            const is503 = errStr.includes('503') || errStr.includes('unavailable') || errStr.includes('high demand');
-            const is429 = errStr.includes('429') || errStr.includes('quota') || errStr.includes('resource_exhausted');
-            const isTimeout = errStr.includes('timeout') || errStr.includes('504');
-
-            if (is503) {
-              consecutive503Count++;
-              if (consecutive503Count >= 2) {
-                fileDelayMs = Math.min(fileDelayMs * 2, 12000);
-                console.warn(`[DriveFolderNavigator] 503 repetido. Pausa aumentada a ${fileDelayMs / 1000}s`);
-              }
-            }
-
-            if ((is503 || is429 || isTimeout) && attempts < MAX_RETRIES) {
-              attempts++;
-              continue;
-            } else {
-              break;
-            }
+          if (singleRes.ok && singleRes.data?.success) break;
+          if (singleRes.status === 401 || singleRes.data?.isAuthError) {
+            authExpired = true;
+            break;
           }
+          // Cupo diario de Gemini agotado: no reintentar y detener el resto del lote
+          if (singleRes.data?.isDailyQuota) {
+            dailyQuotaMessage = singleRes.data.error || 'Se agotó el cupo diario gratuito de Gemini.';
+            break;
+          }
+          const transient =
+            singleRes.status === 429 ||
+            singleRes.status === 502 ||
+            singleRes.status === 503 ||
+            singleRes.status === 504 ||
+            singleRes.status === 0 ||
+            singleRes.data?.isQuota;
+          if (!transient) break;
+        }
 
-          if (singleRes.ok && singleRes.data?.success) {
-            successCount++;
-            if (singleRes.data.spreadsheetUrl) {
-              resolvedSpreadsheetUrl = singleRes.data.spreadsheetUrl;
-            }
-            const driveFileUrl =
-              file.webViewLink ||
-              singleRes.data?.driveUrl ||
-              singleRes.data?.extracted?.driveUrl ||
-              `https://drive.google.com/file/d/${file.id}/view`;
-            const extractedData = {
+        if (singleRes?.ok && singleRes.data?.success) {
+          if (singleRes.data.spreadsheetUrl) resolvedSpreadsheetUrl = singleRes.data.spreadsheetUrl;
+          const driveFileUrl =
+            file.webViewLink || singleRes.data?.driveUrl || `https://drive.google.com/file/d/${file.id}/view`;
+          if (singleRes.data.isDuplicate) {
+            return {
+              fileId: file.id,
+              fileName: file.name,
+              status: 'skipped_duplicate',
+              message: singleRes.data.message,
+              driveUrl: driveFileUrl,
+            };
+          }
+          return {
+            fileId: file.id,
+            fileName: file.name,
+            status: 'success',
+            reviewStatus: singleRes.data.reviewStatus,
+            reasons: singleRes.data.reasons,
+            extracted: {
               ...(singleRes.data.extracted || {}),
               driveUrl: driveFileUrl,
               webViewLink: driveFileUrl,
               fileName: file.name,
-            };
-            results.push({
-              fileId: file.id,
-              fileName: file.name,
-              status: 'success',
-              extracted: extractedData,
-              driveUrl: driveFileUrl,
-            });
-          } else {
-            failureCount++;
-            results.push({
-              fileId: file.id,
-              fileName: file.name,
-              status: 'error',
-              error: singleRes.error || singleRes.data?.error || 'Error al procesar archivo',
-            });
-          }
+            },
+            driveUrl: driveFileUrl,
+          };
+        }
+        return {
+          fileId: file.id,
+          fileName: file.name,
+          status: 'error',
+          error: singleRes?.data?.error || singleRes?.error || 'Error al procesar archivo',
+        };
+      };
 
-          // Pausa preventiva de 1.5s entre archivos y 10s entre lotes de 5
-          if (i < invoiceFiles.length - 1) {
-            if ((i + 1) % 5 === 0) {
-              for (let s = 10; s > 0; s--) {
-                setBatchProgress((prev) =>
-                  prev ? { ...prev, currentFileName: `Pausa entre lotes: ${s}s...` } : null
-                );
-                await new Promise((resolve) => setTimeout(resolve, 1000));
-              }
-            } else {
-              await new Promise((resolve) => setTimeout(resolve, fileDelayMs));
-            }
+      try {
+        let nextIndex = 0;
+        const runWorker = async () => {
+          while (nextIndex < total && !authExpired && !dailyQuotaMessage) {
+            const i = nextIndex++;
+            results[i] = await processOne(invoiceFiles[i]);
+            completed++;
+            setBatchProgress({
+              current: completed,
+              total,
+              currentFileName: invoiceFiles[Math.min(nextIndex, total - 1)].name,
+              percentage: Math.round((completed / total) * 100),
+            });
           }
+        };
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, runWorker));
+
+        if (authExpired) {
+          window.dispatchEvent(new CustomEvent('svh_google_auth_expired'));
+          setBatchError(
+            'Tu sesión con Google Drive y Google Sheets ha expirado. Por favor, pulsa en "Renovar Conexión Google" para continuar.'
+          );
+          return;
         }
 
+        const finalResults = results.filter(Boolean);
+        const successCount = finalResults.filter((r) => r.status === 'success').length;
+        const failureCount = finalResults.filter((r) => r.status === 'error').length;
+        const duplicateCount = finalResults.filter((r) => r.status === 'skipped_duplicate').length;
+        const pendingCount = total - successCount - duplicateCount;
         const finalBatchResult = {
           success: true,
-          message: `Procesamiento completado: ${successCount} facturas registradas en Sheets.`,
+          message:
+            `Procesamiento completado: ${successCount} facturas registradas en Sheets.` +
+            (duplicateCount ? ` ${duplicateCount} omitidas por estar ya registradas.` : '') +
+            (dailyQuotaMessage
+              ? ` ${dailyQuotaMessage} Quedan ${pendingCount} comprobante(s) por leer: vuelve a procesar la carpeta cuando se renueve el cupo.`
+              : ''),
           successCount,
           failureCount,
           spreadsheetUrl: resolvedSpreadsheetUrl,
           folderId: currentFolderId,
           folderName: currentFolderName,
-          results,
+          results: finalResults,
         };
         setBatchResult(finalBatchResult);
 
-        // Al terminar de leer los comprobantes, crear e inyectar automáticamente la hoja corporativa SOLO si hubo éxitos
-        if (results.some((r: any) => r.status === 'success' && r.extracted) && successCount > 0) {
+        // Crear la hoja corporativa solo con las facturas nuevas leídas con éxito
+        if (successCount > 0) {
           setTimeout(() => {
-            handleExportBatchToCorporateSheets(results);
+            handleExportBatchToCorporateSheets(finalResults.filter((r) => r.status === 'success'));
           }, 400);
         }
       } catch (err: any) {
-        console.error('Error durante procesamiento secuencial:', err);
+        console.error('Error durante procesamiento de comprobantes:', err);
         setBatchError(err.message || 'Error inesperado al procesar los archivos');
       } finally {
         setIsBatchProcessing(false);

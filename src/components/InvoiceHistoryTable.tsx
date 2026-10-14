@@ -735,19 +735,6 @@ export const InvoiceHistoryTable: React.FC<InvoiceHistoryTableProps> = ({
           prev ? { ...prev, successCount, errorCount } : null
         );
 
-        // Pausa entre archivos de 1.5s y entre lotes de 5 de 10s
-        if (i < total - 1 && !abortRereadRef.current) {
-          if ((i + 1) % 5 === 0) {
-            for (let s = 10; s > 0 && !abortRereadRef.current; s--) {
-              setRereadProgress((prev) =>
-                prev ? { ...prev, currentFileName: `Pausa entre lotes: ${s}s...` } : null
-              );
-              await new Promise((resolve) => setTimeout(resolve, 1000));
-            }
-          } else {
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-          }
-        }
       }
 
       const wasAborted = abortRereadRef.current;
@@ -923,19 +910,6 @@ export const InvoiceHistoryTable: React.FC<InvoiceHistoryTableProps> = ({
           prev ? { ...prev, successCount, errorCount } : null
         );
 
-        // Pausa preventiva de 1.5s entre archivos y 10s entre lotes de 5
-        if (i < total - 1 && !abortRereadRef.current) {
-          if ((i + 1) % 5 === 0) {
-            for (let s = 10; s > 0 && !abortRereadRef.current; s--) {
-              setRereadProgress((prev) =>
-                prev ? { ...prev, currentFileName: `Pausa entre lotes: ${s}s...` } : null
-              );
-              await new Promise((resolve) => setTimeout(resolve, 1000));
-            }
-          } else {
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-          }
-        }
       }
 
       if (successCount > 0) {

@@ -13,10 +13,19 @@ import {
   getJobsForProject,
   retryJob,
   getBadgeReviewCount,
-  validateAndNormalizeExtraction,
-  INVOICE_SCHEMA_V2,
-  EXACT_SYSTEM_INSTRUCTION,
 } from './src/server/invoiceWorker';
+import { getGenAI, callGemini, isTransientError, isDailyQuotaError } from './src/server/gemini';
+import { extractInvoice, cleanLocaleAmount, InvoiceExtractionError } from './src/server/invoiceExtraction';
+import {
+  ensureSheetLayout,
+  appendRowWithLayout,
+  SheetDuplicateIndex,
+  mapWithConcurrency,
+  getSheetSession,
+  invalidateSheetSession,
+  isGoogleRateLimitError,
+  withGoogleRetry,
+} from './src/server/sheetsWriter';
 
 dotenv.config();
 
@@ -86,11 +95,12 @@ export function isGoogleAuthError(err: any): boolean {
     .join(' ')
     .toLowerCase();
 
+  // Ojo: no buscar "401" como texto suelto; aparece en IDs de archivos, importes o mensajes de cuota
   return (
     numStatus === 401 ||
     rawStatus === '401' ||
     rawStatus === 'UNAUTHENTICATED' ||
-    errorString.includes('401') ||
+    /\b401\b.*unauthori|unauthori[sz]ed/.test(errorString) ||
     errorString.includes('invalid authentication credentials') ||
     errorString.includes('invalid credentials') ||
     errorString.includes('expected oauth 2') ||
@@ -118,6 +128,15 @@ export function handleGoogleApiError(res: express.Response, prefix: string, erro
     });
   }
 
+  if (isGoogleRateLimitError(error)) {
+    console.warn(`[Google Quota] 429 en ${prefix}`);
+    return res.status(429).json({
+      success: false,
+      isQuota: true,
+      error: 'Google Drive/Sheets pidió esperar un momento por exceso de peticiones. Se reintentará automáticamente.',
+    });
+  }
+
   console.error(`Error en ${prefix}:`, error);
   const errMsg = String(
     error?.message ||
@@ -133,680 +152,36 @@ export function handleGoogleApiError(res: express.Response, prefix: string, erro
 }
 
 /**
- * 1. ESQUEMA JSON ESTRICTO PARA EXTRACCIÓN DE FACTURAS (STRUCTURED OUTPUTS)
- * Configurado con @google/genai Type para garantizar respuesta 100% tipada sin desbordes.
+ * Extracción de facturas con IA: toda la lógica vive en src/server/invoiceExtraction.ts y
+ * src/server/gemini.ts. Estas funciones mantienen la firma que usan los endpoints existentes.
  */
-export const INVOICE_EXTRACTION_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    cliente: {
-      type: Type.STRING,
-      description: 'Nombre o razón social del cliente o emisor/proveedor de la factura',
-    },
-    nitRut: {
-      type: Type.STRING,
-      description: 'Número de Identificación Tributaria (NIT, RUT, CIF, NIF o RFC) del emisor/proveedor',
-    },
-    fecha: {
-      type: Type.STRING,
-      description: 'Fecha de emisión en formato YYYY-MM-DD',
-    },
-    numeroFactura: {
-      type: Type.STRING,
-      description: 'Número o folio de la factura/recibo',
-    },
-    concepto: {
-      type: Type.STRING,
-      description: 'Descripción resumida y clara de los conceptos o servicios facturados',
-    },
-    categoria: {
-      type: Type.STRING,
-      description: 'Categoría de obra: Materiales, Mano de Obra, Maquinaria y Equipos, Transporte y Logística, Subcontratas, Seguridad y Salud, Servicios y Licencias o Varios',
-    },
-    subtotal: {
-      type: Type.STRING,
-      description: 'Base imponible o subtotal antes de impuestos como número limpio sin símbolos ni puntos de miles (ejemplo: "775600", "1500000" o "1250.50")',
-    },
-    iva: {
-      type: Type.STRING,
-      description: 'Monto correspondiente al IVA u otros impuestos como número limpio (ejemplo: "147364" o "0")',
-    },
-    total: {
-      type: Type.STRING,
-      description: 'IMPORTE TOTAL DEFINITIVO A PAGAR de la factura como número limpio sin símbolos ni puntos de miles (ejemplo: "922964", "775600", "1500000" o "1250.50")',
-    },
-    moneda: {
-      type: Type.STRING,
-      description: 'Código de moneda detectado (COP, EUR, USD, MXN, etc.)',
-    },
-    items: {
-      type: Type.ARRAY,
-      description: 'Lista detallada de partidas, items o cuadros independientes de la factura con sus valores correspondientes',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          descripcion: {
-            type: Type.STRING,
-            description: 'Descripción o concepto del material, equipo o servicio',
-          },
-          cantidad: {
-            type: Type.NUMBER,
-            description: 'Cantidad de unidades',
-          },
-          precioUnitario: {
-            type: Type.STRING,
-            description: 'Precio o tarifa unitaria como número limpio (ejemplo: "70509" o "25000")',
-          },
-          total: {
-            type: Type.STRING,
-            description: 'Importe total correspondiente a este item como número limpio (ejemplo: "775600" o "50000")',
-          },
-        },
-        required: ['descripcion', 'total'],
-      },
-    },
-    tablas: {
-      type: Type.ARRAY,
-      description: 'Si el documento contiene cuadros o tablas separadas (ej. Materiales, Mano de Obra), objeto distinto por cada tabla independiente',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          nombreTabla: {
-            type: Type.STRING,
-            description: 'Título o categoría de la tabla (ej. Materiales, Mano de Obra)',
-          },
-          items: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                descripcion: { type: Type.STRING },
-                cantidad: { type: Type.NUMBER },
-                precioUnitario: { type: Type.STRING },
-                total: { type: Type.STRING },
-              },
-              required: ['descripcion', 'total'],
-            },
-          },
-          subtotalTabla: { type: Type.STRING },
-        },
-        required: ['nombreTabla', 'items'],
-      },
-    },
-  },
-  required: ['cliente', 'fecha', 'subtotal', 'iva', 'total', 'items'],
-};
+export { cleanLocaleAmount };
 
-/**
- * SYSTEM PROMPT DIRECTO Y ESTRICTO DE MÁXIMA PRECISIÓN
- * Exige el máximo esfuerzo cognitivo para leer el total de la factura y cada valor correspondiente,
- * reconciliar matemáticamente y prohíbe terminantemente inventar datos.
- */
-export const STRICT_SYSTEM_INSTRUCTION = `Eres un asistente experto de máxima precisión en auditoría contable y extracción de datos de facturas, recibos, remisiones y cotizaciones para proyectos de arquitectura y construcción. Tu objetivo primordial es la EXACTITUD MATEMÁTICA Y FIDELIDAD ABSOLUTA de los datos leídos del documento (PDF o imagen).
-
-REGLAS DE OBLIGATORIO CUMPLIMIENTO:
-1. Devuelve ÚNICA Y EXCLUSIVAMENTE un objeto JSON válido que cumpla de manera estricta el esquema solicitado. Cero texto conversacional, sin explicaciones ni markdown.
-2. CERO ALUCINACIONES: NUNCA inventes información. Si un dato no figura en el documento o es ilegible, devuélvelo como null o cadena vacía "".
-3. ESFUERZO MÁXIMO EN LA LECTURA DEL TOTAL DE LA FACTURA Y CADA VALOR:
-   - Examina minuciosamente la totalidad del documento (encabezado, cuerpo de partidas, pie de página, totales y notas tributarias).
-   - Localiza el TOTAL DEFINITIVO A PAGAR del comprobante (frecuentemente etiquetado como "TOTAL A PAGAR", "TOTAL", "VALOR TOTAL", "NETO A PAGAR", "GRAN TOTAL", "TOTAL FACTURA").
-   - Lee con sumo cuidado cada partida/ítem: descripción exacta, cantidad de unidades, precio o tarifa unitaria, e importe total de la línea.
-   - Identifica y extrae el Subtotal (base imponible antes de impuestos) y los Impuestos (IVA, Retenciones, Impoconsumo, etc.).
-   - RECONCILIACIÓN MATEMÁTICA: Comprueba que la suma de las partidas coincida con el Subtotal, y que Subtotal + Impuestos - Retenciones cuadre con el Total definitivo a pagar. Si el documento indica explícitamente un "Total a pagar", ese valor exacto del documento prevalece y debe ser el total.
-   - NUNCA confundas el total de un solo ítem o una sola fila con el Total de la Factura.
-   - NUNCA confundas el Subtotal con el Total.
-4. FORMATO DE NÚMEROS (VALORES LIMPIOS SIN SÍMBOLOS):
-   - Extrae los valores numéricos sin símbolos de moneda ($ € COP USD), sin letras y SIN separadores de miles.
-   - En facturas de Colombia (COP) y países donde el punto "." o la coma "," se usa como separador de miles (ejemplo: "$ 1.500.000" o "$ 775.600" o "$ 70.509"): extrae "1500000", "775600", "70509" (números enteros limpios).
-   - Si la moneda tiene centavos decimales reales (ej: 1250.50 USD): usa el punto decimal estándar "1250.50".
-5. ESTRUCTURA DE TABLAS INDEPENDIENTES:
-   - Si el documento tiene cuadros separados (ej. "Materiales", "Mano de Obra", "Equipos y Maquinaria", "Transporte"), debes crear un objeto distinto para cada tabla dentro del arreglo "tablas" y también incluir todas las partidas en "items".
-6. Identifica el proyecto o la obra a la que pertenece la factura si está mencionado explícitamente en el texto del documento.`;
-
-// Lazy or safe initialization of Gemini AI
-function getGenAI(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-// Helper to determine if an error is a transient high-demand / capacity / rate spike
 function isTransientCapacityError(err: any): boolean {
-  if (!err) return false;
-  const status = err.status || err.code || err.error?.code || err.error?.status;
-  const rawString = typeof err === 'string' ? err : `${err?.message || ''} ${JSON.stringify(err)}`;
-  return (
-    status === 503 ||
-    status === '503' ||
-    status === 429 ||
-    status === '429' ||
-    status === 'UNAVAILABLE' ||
-    status === 'RESOURCE_EXHAUSTED' ||
-    rawString.includes('503') ||
-    rawString.includes('high demand') ||
-    rawString.includes('temporary') ||
-    rawString.includes('UNAVAILABLE') ||
-    rawString.includes('overloaded') ||
-    rawString.includes('RESOURCE_EXHAUSTED') ||
-    rawString.includes('429') ||
-    rawString.includes('quota')
-  );
+  return isTransientError(err);
 }
 
-// Cache global para recordar modelos con cuota agotada (429) y evitar reintentos inútiles
-const modelCooldownMap = new Map<string, number>();
-
-// Helper to clean and parse amounts accurately from any locale (e.g., "$ 1.500.000", "450.000", "775.600", "70.509", "1,500,000.00", "1500,50", "1250.50")
-export function cleanLocaleAmount(val: any): number {
-  if (val === undefined || val === null) return 0;
-  if (typeof val === 'number') {
-    return isNaN(val) ? 0 : val;
-  }
-  let str = String(val).trim().replace(/[€$£¥\s]/g, '').replace(/COP|USD|EUR|MXN|PEN|CLP/gi, '').trim();
-  if (!str) return 0;
-
-  const lastDot = str.lastIndexOf('.');
-  const lastComma = str.lastIndexOf(',');
-
-  if (lastDot !== -1 && lastComma !== -1) {
-    if (lastDot < lastComma) {
-      // e.g. "1.500.000,50" -> dot is thousand separator, comma is decimal
-      str = str.replace(/\./g, '').replace(',', '.');
-    } else {
-      // e.g. "1,500,000.50" -> comma is thousand separator, dot is decimal
-      str = str.replace(/,/g, '');
-    }
-  } else if (lastComma !== -1) {
-    const commas = (str.match(/,/g) || []).length;
-    if (commas > 1) {
-      str = str.replace(/,/g, '');
-    } else {
-      const parts = str.split(',');
-      if (parts[1].length === 3 && parts[0].length <= 3) {
-        // e.g. "775,600" or "1,500" -> thousand separator
-        str = str.replace(',', '');
-      } else {
-        // e.g. "1500,50" -> standard decimal
-        str = parts[0] + '.' + parts[1];
-      }
-    }
-  } else if (lastDot !== -1) {
-    const dots = (str.match(/\./g) || []).length;
-    if (dots > 1) {
-      // Multiple dots: e.g. "1.500.000" -> all are thousand separators
-      str = str.replace(/\./g, '');
-    } else {
-      const parts = str.split('.');
-      if (parts[1].length === 3) {
-        // Exactly 3 digits after dot: e.g. "775.600" or "70.509" in COP / Latin America
-        str = str.replace('.', '');
-      }
-      // If parts[1].length === 1 or 2 (e.g. "1250.50" or "450.5"): keep dot as standard decimal!
-    }
-  }
-
-  const num = parseFloat(str);
-  return isNaN(num) ? 0 : num;
-}
-
-// Centralized execution with intelligent backoff, deep thinking levels for maximum effort, and multi-model failover
+// Mantiene la firma anterior (ai, contents, config, tarea, modelo) para los endpoints de nóminas y análisis
 async function callGeminiWithRetry(
-  ai: GoogleGenAI,
+  _ai: GoogleGenAI,
   contents: any,
   schemaConfig: any,
   taskDescription: string = 'Inferencia IA',
   preferredModel?: string
 ): Promise<{ success: boolean; text?: string; error?: any; modelUsed?: string }> {
-  // Pool de modelos válidos y de alta capacidad soportados por la API de Gemini:
-  // 1. 'gemini-3.5-flash' (modelo principal con amplio cupo, ultrarrápido ~1.5s y soporte nativo de PDF/imágenes)
-  // 2. 'gemini-3-flash-preview' (modelo de alta fidelidad para documentos contables complejos)
-  // 3. 'gemini-3.8-flash' (modelo con extended thinking de auditoría profunda)
-  // 4. 'gemini-3.1-flash-lite' (modelo de respaldo independiente)
-  const defaultModels = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
-  const candidateModels = preferredModel
-    ? [preferredModel, ...defaultModels.filter((m) => m !== preferredModel)]
-    : defaultModels;
-  let lastError: any = null;
-
-  const now = Date.now();
-
-  // Filtrar modelos disponibles que no estén en cooldown activo
-  const availableModels = candidateModels.filter((m) => (modelCooldownMap.get(m) || 0) <= now);
-  // Si todos los modelos están marcados en cooldown, no abandonar la petición:
-  // reintentar con el modelo de mayor capacidad (gemini-3.5-flash) o los modelos configurados
-  const modelsToTry = availableModels.length > 0 ? availableModels : candidateModels;
-
-  for (const modelName of modelsToTry) {
-    const maxAttempts = 2; // Máximo 2 intentos por modelo para conmutar rápido si hay saturación
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        console.log(`[Gemini] ${taskDescription} con ${modelName} (intento ${attempt}/${maxAttempts})...`);
-
-        const configWithThinking: any = {
-          ...schemaConfig,
-          temperature: 0,
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        };
-
-        let contentsForModel = contents;
-        if (modelName.includes('lite') && Array.isArray(contents)) {
-          // gemini-3.1-flash-lite no acepta application/pdf directo en inlineData.
-          // Convertimos cualquier parte PDF en captura PNG de alta fidelidad y texto nativo
-          // para que nunca se descarte el documento ni se produzca error 400 (INVALID_ARGUMENT).
-          const adaptedParts: any[] = [];
-          for (const part of contents) {
-            if (part?.inlineData?.mimeType === 'application/pdf') {
-              try {
-                const pdfBuf = Buffer.from(part.inlineData.data, 'base64');
-                const p = new PDFParse({ data: pdfBuf });
-                const ss = await p.getScreenshot({ scale: 1.5, first: 3 });
-                if (ss?.pages && ss.pages.length > 0) {
-                  for (const page of ss.pages.slice(0, 3)) {
-                    if (page.dataUrl) {
-                      adaptedParts.push({
-                        inlineData: {
-                          mimeType: 'image/png',
-                          data: page.dataUrl.replace(/^data:image\/png;base64,/, ''),
-                        },
-                      });
-                    }
-                  }
-                }
-                const txt = await p.getText();
-                if (txt?.text && txt.text.trim()) {
-                  adaptedParts.push({
-                    text: `--- TEXTO DEL DOCUMENTO ---\n${txt.text.slice(0, 15000)}`,
-                  });
-                }
-                await p.destroy();
-              } catch (convErr) {
-                console.warn('[Gemini fallback] Error al convertir PDF para flash-lite:', convErr);
-              }
-            } else {
-              adaptedParts.push(part);
-            }
-          }
-          if (adaptedParts.length > 0) {
-            contentsForModel = adaptedParts;
-          }
-        }
-
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: contentsForModel,
-          config: configWithThinking,
-        });
-
-        if (response.text) {
-          console.log(`[Gemini] ${taskDescription} completado con éxito mediante ${modelName}`);
-          return { success: true, text: response.text, modelUsed: modelName };
-        }
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err?.message || (typeof err === 'string' ? err : JSON.stringify(err));
-
-        // Si el modelo da 404 (no existe o descontinuado), saltar inmediatamente al siguiente
-        if (err?.status === 404 || errMsg.includes('404') || errMsg.includes('NOT_FOUND')) {
-          modelCooldownMap.set(modelName, Date.now() + 3600000); // 1 hora de cooldown
-          break;
-        }
-
-        // Si es 429 (cuota de Free Tier agotada / RESOURCE_EXHAUSTED)
-        const isQuota429 =
-          errMsg.includes('RESOURCE_EXHAUSTED') ||
-          errMsg.includes('Quota exceeded') ||
-          errMsg.includes('exceeded your current quota') ||
-          err?.status === 429 ||
-          err?.code === 429 ||
-          err?.error?.code === 429;
-
-        if (isQuota429) {
-          // Detectar tiempo de espera si viene en formato "22h10m59s" o "60s"
-          let cooldownSeconds = 60;
-          const hMatch = errMsg.match(/([0-9.]+)h/i);
-          const mMatch = errMsg.match(/([0-9.]+)m/i);
-          const sMatch = errMsg.match(/([0-9.]+)s/i);
-          if (hMatch || mMatch || sMatch) {
-            const h = hMatch ? parseFloat(hMatch[1]) : 0;
-            const m = mMatch ? parseFloat(mMatch[1]) : 0;
-            const s = sMatch ? parseFloat(sMatch[1]) : 0;
-            cooldownSeconds = Math.ceil(h * 3600 + m * 60 + s) + 5;
-          } else if (errMsg.includes('daily') || errMsg.includes('PerDay') || errMsg.includes('limit: 20')) {
-            cooldownSeconds = 12 * 3600;
-          }
-          modelCooldownMap.set(modelName, Date.now() + cooldownSeconds * 1000);
-
-          console.log(`[Gemini] Modelo ${modelName} cuota agotada (429). Enfriamiento por ${Math.round(cooldownSeconds / 60)} min. Conmutando a modelo alternativo...`);
-          break;
-        }
-
-        // Si es 503 o alta demanda temporal ("This model is currently experiencing high demand" / UNAVAILABLE)
-        const is503 =
-          err?.status === 503 ||
-          err?.code === 503 ||
-          err?.error?.code === 503 ||
-          err?.error?.status === 'UNAVAILABLE' ||
-          errMsg.includes('503') ||
-          errMsg.includes('high demand') ||
-          errMsg.includes('UNAVAILABLE') ||
-          errMsg.includes('overloaded');
-
-        if (is503) {
-          if (attempt === 1) {
-            // Reintento con backoff breve de 1.2s - 2.0s
-            const backoffDelay = 1200 + Math.round(Math.random() * 800);
-            console.log(`[Gemini] Modelo ${modelName} con alta demanda momentánea (503). Reintentando en ${backoffDelay}ms...`);
-            await new Promise((resolve) => setTimeout(resolve, backoffDelay));
-            continue;
-          }
-
-          // Si tras el reintento persiste el 503, poner en cooldown de 45s y conmutar
-          modelCooldownMap.set(modelName, Date.now() + 45000);
-          console.log(`[Gemini] Modelo ${modelName} saturado (503). Conmutando a modelo alternativo...`);
-          break;
-        }
-
-        // Para otros errores no esperados, registrar una línea limpia sin volcar objetos JSON
-        console.log(`[Gemini] Aviso al consultar ${modelName} (${taskDescription}): ${err?.message || 'Error en consulta'}`);
-        break;
-      }
-    }
-  }
-
-  return { success: false, error: lastError };
+  const r = await callGemini(contents, schemaConfig, { task: taskDescription, preferredModel });
+  return { success: r.success, text: r.text, error: r.error, modelUsed: r.modelUsed };
 }
 
-// Helper unificado para extracción con Structured Outputs (JSON Schema estricto)
 export async function extractInvoiceWithStructuredOutput(
-  ai: GoogleGenAI,
+  _ai: GoogleGenAI,
   fileBase64: string,
   mimeType: string,
   fileName: string = 'factura',
   preferredModel?: string
-): Promise<{
-  cliente: string;
-  nitRut: string;
-  fecha: string;
-  numeroFactura?: string;
-  concepto: string;
-  categoria?: string;
-  subtotal: number;
-  iva: number;
-  total: number;
-  moneda: string;
-  items: Array<{
-    descripcion: string;
-    cantidad?: number;
-    precioUnitario?: number;
-    total: number;
-  }>;
-  tablas?: any[];
-  // Compatibilidad hacia atrás
-  vendorName: string;
-  vendorTaxId: string;
-  date: string;
-  invoiceNumber: string;
-  concept: string;
-  category: string;
-  taxAmount: number;
-  totalAmount: number;
-  currency: string;
-  aiExtracted?: boolean;
-  modelUsed?: string | null;
-}> {
-  const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
-
-  let actualMime = mimeType || 'image/jpeg';
-  const lowerName = fileName.toLowerCase();
-  // PDF detection via magic bytes (%PDF- in base64 is JVBERi0) or mime/filename
-  if (lowerName.endsWith('.pdf') || cleanBase64.startsWith('JVBERi0') || (mimeType && mimeType.includes('pdf'))) {
-    actualMime = 'application/pdf';
-  } else if (lowerName.endsWith('.png') || (mimeType && mimeType.includes('png'))) {
-    actualMime = 'image/png';
-  } else if (lowerName.endsWith('.webp') || (mimeType && mimeType.includes('webp'))) {
-    actualMime = 'image/webp';
-  } else if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg') || (mimeType && mimeType.includes('jpeg'))) {
-    actualMime = 'image/jpeg';
-  }
-
-  // Pre-procesamiento de PDFs: extraer texto nativo y renderizar páginas a PNG
-  // Esto permite que modelos como gemini-3.1-flash-lite (que solo aceptan imágenes o texto)
-  // analicen facturas en PDF con fidelidad absoluta sin dar error 400 (INVALID_ARGUMENT).
-  let pdfText = '';
-  const renderedPages: string[] = [];
-  let imageBase64ToSend = cleanBase64;
-  let mimeToSend = actualMime;
-
-  if (actualMime === 'application/pdf' || cleanBase64.startsWith('JVBERi0')) {
-    try {
-      const pdfBuf = Buffer.from(cleanBase64, 'base64');
-      const parser = new PDFParse({ data: pdfBuf });
-      try {
-        const textRes = await parser.getText();
-        if (textRes?.text && textRes.text.trim().length > 5) {
-          pdfText = textRes.text.trim();
-        }
-      } catch (tErr) {
-        console.warn(`[PDFParse] Aviso al extraer texto nativo para "${fileName}":`, tErr);
-      }
-
-      try {
-        const ssRes = await parser.getScreenshot({ scale: 1.5, first: 3 });
-        if (ssRes?.pages && ssRes.pages.length > 0) {
-          for (const page of ssRes.pages.slice(0, 3)) {
-            if (page.dataUrl) {
-              renderedPages.push(page.dataUrl.replace(/^data:image\/png;base64,/, ''));
-            }
-          }
-        }
-      } catch (sErr) {
-        console.warn(`[PDFParse] Aviso al renderizar captura PNG para "${fileName}":`, sErr);
-      }
-
-      // Si no se obtuvo captura PNG, intentar extraer imágenes escaneadas embebidas
-      if (renderedPages.length === 0) {
-        try {
-          const imgRes = await parser.getImage();
-          const firstImg = imgRes?.pages?.[0]?.images?.[0];
-          if (firstImg?.data) {
-            const imgBuf = Buffer.isBuffer(firstImg.data) ? firstImg.data : Buffer.from(firstImg.data);
-            imageBase64ToSend = imgBuf.toString('base64');
-            mimeToSend = 'image/jpeg';
-          }
-        } catch (imgErr) {
-          console.warn(`[PDFParse] Aviso al extraer imágenes embebidas para "${fileName}":`, imgErr);
-        }
-      }
-
-      await parser.destroy();
-    } catch (pdfErr) {
-      console.warn(`[PDFParse] Error inicializando parser para "${fileName}":`, pdfErr);
-    }
-  }
-
-  const schemaConfig = {
-    responseMimeType: 'application/json',
-    responseSchema: INVOICE_SCHEMA_V2,
-    systemInstruction: EXACT_SYSTEM_INSTRUCTION,
-    temperature: 0,
-    thinkingConfig: {
-      thinkingBudget: 0,
-    },
-  };
-
-  const contentParts: any[] = [];
-
-  // Agregar el documento original con su mimeType nativo (application/pdf, image/png, image/jpeg, etc.)
-  if (cleanBase64) {
-    contentParts.push({
-      inlineData: {
-        mimeType: actualMime,
-        data: cleanBase64,
-      },
-    });
-  }
-
-  // Si no es PDF pero se extrajeron imágenes complementarias, agregarlas
-  if (actualMime !== 'application/pdf' && renderedPages.length > 0) {
-    for (const pageImg of renderedPages) {
-      contentParts.push({
-        inlineData: {
-          mimeType: 'image/png',
-          data: pageImg,
-        },
-      });
-    }
-  }
-
-  let promptText = `Extrae los datos de esta factura colombiana según el esquema JSON: "${fileName}".`;
-
-  if (pdfText) {
-    promptText += `\n\n--- TEXTO DIRECTO EXTRAÍDO DEL DOCUMENTO ---\n${pdfText.slice(0, 15000)}`;
-  }
-
-  contentParts.push(promptText);
-
-  const geminiResult = await callGeminiWithRetry(
-    ai,
-    contentParts,
-    schemaConfig,
-    `Auditoría y Extracción Exhaustiva (${fileName})`,
-    preferredModel
-  );
-
-  let parsed: any = null;
-
-  if (geminiResult.success && geminiResult.text) {
-    try {
-      const rawJson = geminiResult.text.trim().replace(/^```json/i, '').replace(/```$/i, '').trim();
-      parsed = JSON.parse(rawJson);
-    } catch (parseError) {
-      console.warn(`[Gemini] Error interpretando JSON devuelto para "${fileName}":`, parseError);
-    }
-  }
-
-  // REGLA FUNDAMENTAL: NUNCA inventar información ni generar datos de respaldo ficticios.
-  // Si la IA no pudo extraer datos o el documento no es legible, no generar registros simulados;
-  // el usuario generará o verificará los datos contables.
-  if (!parsed) {
-    const errorDetail = geminiResult.error ? (geminiResult.error.message || String(geminiResult.error)) : 'No se pudo interpretar el formato contable';
-    throw new Error(`No se pudieron extraer datos del comprobante "${fileName}": ${errorDetail}. No se generan datos ficticios.`);
-  }
-
-  // Si un dato no figura explícitamente en el documento, devolver null o cadena vacía ""
-  const cliente = (parsed.cliente || parsed.vendorName || '').trim();
-  const nitRut = (parsed.nitRut || parsed.vendorTaxId || '').trim();
-  const fecha = (parsed.fecha || parsed.date || '').trim();
-  const numeroFactura = (parsed.numeroFactura || parsed.invoiceNumber || '').trim();
-  const concepto = (parsed.concepto || parsed.concept || '').trim();
-  const categoria = (parsed.categoria || parsed.category || '').trim();
-  
-  let subtotal = cleanLocaleAmount(parsed.subtotal);
-  let iva = cleanLocaleAmount(parsed.iva ?? parsed.taxAmount);
-  let total = cleanLocaleAmount(parsed.total ?? parsed.totalAmount);
-  const moneda = (parsed.moneda || parsed.currency || 'COP').trim();
-
-  let rawItems = Array.isArray(parsed.items) ? [...parsed.items] : [];
-
-  // Si el documento tiene cuadros o tablas independientes (regla 3), extraer items de cada tabla
-  if (rawItems.length === 0 && Array.isArray(parsed.tablas)) {
-    for (const t of parsed.tablas) {
-      if (Array.isArray(t.items)) {
-        for (const it of t.items) {
-          rawItems.push({
-            ...it,
-            descripcion: t.nombreTabla ? `[${t.nombreTabla}] ${it.descripcion || ''}` : it.descripcion,
-          });
-        }
-      }
-    }
-  }
-
-  const normalizedItems = rawItems.map((it: any) => {
-    const qty = typeof it.cantidad === 'number' ? it.cantidad : (parseFloat(it.cantidad || it.quantity) || 1);
-    let unitPrice = typeof it.precioUnitario === 'number' ? it.precioUnitario : cleanLocaleAmount(it.precioUnitario ?? it.unitPrice);
-    let itemTotal = typeof it.total === 'number' ? it.total : cleanLocaleAmount(it.total);
-
-    // Reconciliar valores correspondientes de cada partida
-    if (itemTotal === 0 && unitPrice > 0 && qty > 0) {
-      itemTotal = Math.round(qty * unitPrice * 100) / 100;
-    }
-    if (unitPrice === 0 && itemTotal > 0 && qty > 0) {
-      unitPrice = Math.round((itemTotal / qty) * 100) / 100;
-    }
-
-    const desc = (it.descripcion || it.description || '').trim();
-
-    return {
-      descripcion: desc,
-      cantidad: qty,
-      precioUnitario: unitPrice,
-      total: itemTotal,
-      description: desc,
-      quantity: qty,
-      unitPrice: unitPrice,
-    };
-  });
-
-  // Reconciliación matemática rigurosa de importes
-  if (subtotal === 0 && normalizedItems.length > 0) {
-    const sumItems = normalizedItems.reduce((acc: number, it: any) => acc + (it.total || 0), 0);
-    if (sumItems > 0) {
-      subtotal = Math.round(sumItems * 100) / 100;
-    }
-  }
-
-  if (total === 0) {
-    if (subtotal > 0 || iva > 0) {
-      total = Math.round((subtotal + iva) * 100) / 100;
-    } else if (normalizedItems.length > 0) {
-      const sumItems = normalizedItems.reduce((acc: number, it: any) => acc + (it.total || 0), 0);
-      if (sumItems > 0) {
-        total = Math.round(sumItems * 100) / 100;
-        if (subtotal === 0) subtotal = total;
-      }
-    }
-  } else if (total > 0 && subtotal === 0 && iva === 0) {
-    subtotal = total;
-  }
-
-  return {
-    cliente,
-    nitRut,
-    fecha,
-    numeroFactura,
-    concepto,
-    categoria,
-    subtotal,
-    iva,
-    total,
-    moneda,
-    items: normalizedItems,
-    tablas: Array.isArray(parsed.tablas) ? parsed.tablas : [],
-    aiExtracted: !!geminiResult.success,
-    modelUsed: geminiResult.modelUsed || null,
-    // Compatibilidad retroactiva
-    vendorName: cliente,
-    vendorTaxId: nitRut,
-    date: fecha,
-    invoiceNumber: numeroFactura,
-    concept: concepto,
-    category: categoria,
-    taxAmount: iva,
-    totalAmount: total,
-    currency: moneda,
-  };
+): Promise<any> {
+  const result = await extractInvoice({ base64: fileBase64, mimeType, fileName, preferredModel });
+  return { ...result.data, status: result.status, durationMs: result.durationMs };
 }
 
 /**
@@ -899,78 +274,33 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-// Endpoint to analyze invoice with Gemini (Optimizado al máximo: Flash, Temp 0, Thinking 0, Esquema Estricto)
+// Analiza una factura subida desde el navegador y devuelve los datos para el modal de revisión
 app.post('/api/analyze-invoice', async (req, res) => {
-  const startTime = Date.now();
   try {
-    const { imageBase64, mimeType, fileName } = req.body;
-
+    const { imageBase64, mimeType, fileName, model } = req.body;
     if (!imageBase64) {
-      return res.status(400).json({ success: false, error: 'Falta la imagen en formato base64' });
+      return res.status(400).json({ success: false, error: 'Falta el archivo de la factura.' });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({
-        success: false,
-        error: 'GEMINI_API_KEY no está configurada en las variables de entorno del servidor.',
-      });
-    }
-
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-    });
-
-    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
-    const actualMime = mimeType || (cleanBase64.startsWith('JVBERi0') ? 'application/pdf' : 'image/jpeg');
-
-    const resAi = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: [
-        {
-          inlineData: {
-            mimeType: actualMime,
-            data: cleanBase64,
-          },
-        },
-        'Extrae los datos de esta factura colombiana según el esquema JSON.',
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: INVOICE_SCHEMA_V2,
-        systemInstruction: EXACT_SYSTEM_INSTRUCTION,
-        temperature: 0,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    });
-
-    const rawJson = resAi?.text?.trim()?.replace(/^```json/i, '')?.replace(/```$/i, '')?.trim();
-    if (!rawJson) {
-      throw new Error('La IA no devolvió contenido JSON válido.');
-    }
-    const parsed = JSON.parse(rawJson);
-    const validated = validateAndNormalizeExtraction(parsed);
-    const durationMs = Date.now() - startTime;
-    console.log(`[Gemini Benchmark Direct] Factura "${fileName || 'doc'}" procesada en ${durationMs}ms (meta <= 8000ms). Estado: ${validated.status}`);
+    const result = await extractInvoice({ base64: imageBase64, mimeType, fileName, preferredModel: model });
+    console.log(`[Factura] "${fileName || 'doc'}" leída en ${result.durationMs} ms con ${result.modelUsed} → ${result.status}`);
 
     return res.json({
       success: true,
-      data: validated.data,
-      status: validated.status,
-      durationMs,
+      data: result.data,
+      status: result.status,
+      reasons: result.reasons,
+      modelUsed: result.modelUsed,
+      durationMs: result.durationMs,
     });
   } catch (error: any) {
-    const errMsg = error?.message || '';
-    const isQuota = isTransientCapacityError(error) || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED');
-    console.log('[API] Aviso en análisis de factura:', isQuota ? 'Demanda transitoria o cuota' : errMsg);
-
-    return res.json({
+    const isQuota = isTransientCapacityError(error?.cause ?? error);
+    console.warn('[Factura] Error al analizar:', error?.message || error);
+    return res.status(isQuota ? 429 : 422).json({
       success: false,
       isQuota,
-      error: isQuota
-        ? 'La API de Gemini está experimentando alta demanda momentánea (503/429). Por favor, presiona "Realizar nuevamente la extracción" en unos segundos.'
-        : 'Error al procesar la factura con Gemini: ' + (errMsg || 'Error desconocido'),
+      isDailyQuota: isDailyQuotaError(error),
+      error: error?.message || 'No se pudo leer la factura.',
     });
   }
 });
@@ -1096,7 +426,7 @@ app.get('/api/invoices/jobs', (req, res) => {
 // Reintentar manualmente un trabajo en estado 'error' o 'revisar'
 app.post('/api/invoices/jobs/:id/retry', (req, res) => {
   const { id } = req.params;
-  const job = retryJob(id);
+  const job = retryJob(id, extractOAuthToken(req) || undefined);
   if (!job) {
     return res.status(404).json({ success: false, error: 'Trabajo no encontrado.' });
   }
@@ -1117,7 +447,7 @@ app.get('/api/invoices/badge-review', (req, res) => {
  */
 app.post('/api/process-folder', async (req, res) => {
   try {
-    const { folderId, spreadsheetId, sheetName = 'Facturas Registradas' } = req.body;
+    const { folderId, spreadsheetId, sheetName } = req.body;
     const token = extractOAuthToken(req);
 
     if (!token) {
@@ -1137,59 +467,44 @@ app.post('/api/process-folder', async (req, res) => {
       });
     }
 
-    const ai = getGenAI();
-    if (!ai) {
+    if (!getGenAI()) {
       return res.status(500).json({
         success: false,
-        error: 'GEMINI_API_KEY no está configurada en el servidor.',
+        error: 'GEMINI_API_KEY no está configurada en el servidor. Añádela al archivo .env y reinicia.',
       });
     }
 
-    // Inicializar clientes autenticados de Google APIs (Drive v3 y Sheets v4)
     const oauth2Client = new google.auth.OAuth2();
     oauth2Client.setCredentials({ access_token: token });
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
-    // 1. Listar todos los archivos dentro de la carpeta en Drive
-    console.log(`[Batch Drive] Listando archivos en la carpeta: ${folderId}...`);
-    const driveListRes = await drive.files.list({
-      q: `'${folderId}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'`,
-      fields: 'files(id, name, mimeType, webViewLink, size)',
-      pageSize: 50,
-    });
-
-    const allFiles = driveListRes.data.files || [];
-    if (allFiles.length === 0) {
-      return res.json({
-        success: true,
-        message: 'No se encontraron archivos en la carpeta indicada.',
-        folderId,
-        totalFiles: 0,
-        processedCount: 0,
-        results: [],
+    // 1. Listar archivos de la carpeta (paginado)
+    const allFiles: any[] = [];
+    let pageToken: string | undefined;
+    do {
+      const list = await drive.files.list({
+        q: `'${folderId}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'`,
+        fields: 'nextPageToken, files(id, name, mimeType, webViewLink, size)',
+        pageSize: 200,
+        pageToken,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       });
-    }
+      allFiles.push(...(list.data.files || []));
+      pageToken = list.data.nextPageToken || undefined;
+    } while (pageToken && allFiles.length < 1000);
 
-    // Filtrar archivos soportados (PDF, imágenes y hojas de cálculo)
     const supportedFiles = allFiles.filter((file) => {
       const name = (file.name || '').toLowerCase();
       const mime = (file.mimeType || '').toLowerCase();
       return (
         mime === 'application/pdf' ||
         mime.startsWith('image/') ||
-        name.endsWith('.pdf') ||
-        name.endsWith('.png') ||
-        name.endsWith('.jpg') ||
-        name.endsWith('.jpeg') ||
-        name.endsWith('.webp') ||
-        name.endsWith('.xlsx') ||
-        name.endsWith('.xls') ||
-        name.endsWith('.csv')
+        mime === 'application/vnd.google-apps.document' ||
+        /\.(pdf|png|jpe?g|webp|heic|xlsx|xls|csv)$/.test(name)
       );
     });
-
-    console.log(`[Batch Drive] Se detectaron ${allFiles.length} archivos, de los cuales ${supportedFiles.length} son facturas/documentos procesables.`);
 
     if (supportedFiles.length === 0) {
       return res.json({
@@ -1204,336 +519,100 @@ app.post('/api/process-folder', async (req, res) => {
       });
     }
 
-    // Limitar tamaño de lote para evitar timeout de red de Cloud Run (límite 60s)
-    const maxFilesToProcess = Math.min(Number(req.body.maxFiles) || 8, 20);
-    const filesToProcess = supportedFiles.slice(0, maxFilesToProcess);
-
-    // 2. Resolver o preparar la hoja de cálculo de Google Sheets
-    let targetSpreadsheetId = spreadsheetId;
-    let targetSheetTitle = sheetName;
-
-    // Si no se proporcionó spreadsheetId, buscar si ya existe una hoja de cálculo en la carpeta o crear una automáticamente
+    // 2. Hoja de destino: la indicada, una existente en la carpeta o una nueva
+    let targetSpreadsheetId: string | null | undefined = spreadsheetId;
     if (!targetSpreadsheetId) {
-      const existingSheet = allFiles.find(
-        (f) =>
-          f.mimeType === 'application/vnd.google-apps.spreadsheet' ||
-          (f.name || '').toLowerCase().endsWith('.xlsx')
-      );
-
-      if (existingSheet && existingSheet.mimeType === 'application/vnd.google-apps.spreadsheet') {
+      const existingSheet = allFiles.find((f) => f.mimeType === 'application/vnd.google-apps.spreadsheet');
+      if (existingSheet) {
         targetSpreadsheetId = existingSheet.id;
-        console.log(`[Batch Sheets] Usando Google Sheet existente en la carpeta: ${existingSheet.name} (${targetSpreadsheetId})`);
       } else {
-        // Obtener el nombre de la carpeta para titular la nueva hoja con el nombre del proyecto más "Facturación"
         const folderMeta = await drive.files.get({ fileId: folderId, fields: 'name' }).catch(() => null);
         const rawFolderName = folderMeta?.data?.name || 'Facturas';
         const baseProject = rawFolderName.replace(/^(Obra:\s*|Proyecto:\s*)/i, '').replace(/[:\/\\?*|"]/g, ' ').trim() || rawFolderName;
-        const cleanSheetTitle = /facturaci[oó]n/i.test(baseProject) ? baseProject : `${baseProject} Facturación`;
-
-        const createdSheet = await sheets.spreadsheets.create({
-          requestBody: {
-            properties: { title: cleanSheetTitle },
-          },
-        });
-        targetSpreadsheetId = createdSheet.data.spreadsheetId;
-
-        // Mover la hoja creada dentro de la misma carpeta de Drive para organización limpia
+        const title = /facturaci[oó]n/i.test(baseProject) ? baseProject : `${baseProject} Facturación`;
+        const created = await sheets.spreadsheets.create({ requestBody: { properties: { title } } });
+        targetSpreadsheetId = created.data.spreadsheetId;
         if (targetSpreadsheetId) {
-          await drive.files.update({
-            fileId: targetSpreadsheetId,
-            addParents: folderId,
-            fields: 'id, parents',
-          });
-          console.log(`[Batch Sheets] Nueva hoja de cálculo creada con éxito: ${targetSpreadsheetId} en carpeta ${folderId}`);
+          await drive.files.update({ fileId: targetSpreadsheetId, addParents: folderId, fields: 'id, parents' });
         }
       }
     }
+    if (!targetSpreadsheetId) throw new Error('No se pudo preparar la hoja de cálculo de destino.');
 
-    // Configurar o asegurar encabezados en la hoja de Google Sheets
-    if (targetSpreadsheetId) {
+    const layout = await ensureSheetLayout(sheets, targetSpreadsheetId, sheetName);
+    const dupIndex = await SheetDuplicateIndex.load(sheets, layout);
+
+    // 3. Procesar en paralelo con un límite de tiempo por lote; el cliente puede pedir el siguiente lote
+    const maxFiles = Math.min(Number(req.body.maxFiles) || 12, 40);
+    const pending = supportedFiles.filter((f) => !dupIndex.checkFile(f.id, f.name));
+    const skippedUpfront = supportedFiles.filter((f) => dupIndex.checkFile(f.id, f.name));
+    const filesToProcess = pending.slice(0, maxFiles);
+    const deadline = Date.now() + (Number(req.body.timeBudgetMs) || 50_000);
+
+    const processed = await mapWithConcurrency(filesToProcess, WORKER_CONCURRENCY, async (file) => {
+      let fileName = file.name || file.id;
+      if (Date.now() > deadline) {
+        return { fileId: file.id, fileName, status: 'deferred', message: 'Pendiente para el siguiente lote.' };
+      }
       try {
-        const spreadsheetMeta = await sheets.spreadsheets.get({
-          spreadsheetId: targetSpreadsheetId,
-          fields: 'sheets.properties',
-        });
-        targetSheetTitle = spreadsheetMeta.data.sheets?.[0]?.properties?.title || targetSheetTitle;
-
-        // Verificar si la fila 1 ya contiene encabezados
-        const checkHeaders = await sheets.spreadsheets.values.get({
-          spreadsheetId: targetSpreadsheetId,
-          range: `'${targetSheetTitle.replace(/'/g, "''")}'!A1:J1`,
-        });
-
-        const hasHeaders = checkHeaders.data.values && checkHeaders.data.values.length > 0;
-        if (!hasHeaders) {
-          // Formato estándar de columnas por defecto
-          const defaultHeaders = [
-            'Fecha',
-            'Cliente / Proveedor',
-            'NIT / RUT',
-            'Conceptos / Items',
-            'Subtotal',
-            'IVA',
-            'Total',
-            'Moneda',
-            'Nombre Archivo',
-            'Enlace Drive',
-          ];
-
-          await sheets.spreadsheets.values.append({
-            spreadsheetId: targetSpreadsheetId,
-            range: `'${targetSheetTitle.replace(/'/g, "''")}'!A1:J1`,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: {
-              values: [defaultHeaders],
-            },
-          });
-          console.log(`[Batch Sheets] Encabezados por defecto inyectados en "${targetSheetTitle}"`);
-        }
-      } catch (headErr) {
-        console.warn('[Batch Sheets] Aviso al verificar encabezados:', headErr);
-      }
-    }
-
-    // 3. Obtener facturas ya registradas en la hoja para PREVENIR DUPLICADOS Y DOBLE FACTURACIÓN
-    const existingFileIds = new Set<string>();
-    const existingFileNames = new Set<string>();
-    const existingInvoiceKeys = new Set<string>();
-
-    if (targetSpreadsheetId) {
-      try {
-        const existingData = await sheets.spreadsheets.values.get({
-          spreadsheetId: targetSpreadsheetId,
-          range: `'${targetSheetTitle.replace(/'/g, "''")}'!A2:J500`,
-        });
-        const rows = existingData.data.values || [];
-        for (const r of rows) {
-          if (r[8]) {
-            const fName = String(r[8]).trim().toLowerCase();
-            existingFileNames.add(fName);
-            existingFileNames.add(fName.replace(/\.[a-z0-9]+$/i, ''));
-          }
-          if (r[9]) {
-            const link = String(r[9]);
-            const matchId = link.match(/\/d\/([a-zA-Z0-9_-]+)/);
-            if (matchId && matchId[1]) existingFileIds.add(matchId[1]);
-          }
-          if (r[1] && r[6]) {
-            existingInvoiceKeys.add(`${String(r[1]).trim().toLowerCase()}__${String(r[6]).trim()}`);
-          }
-          if (r[1] && r[3]) {
-            existingInvoiceKeys.add(`${String(r[1]).trim().toLowerCase()}__${String(r[3]).trim().toLowerCase()}`);
-          }
-        }
-      } catch (checkErr) {
-        console.warn('[Batch Loop] Aviso al leer facturas previas para anti-duplicados:', checkErr);
-      }
-    }
-
-    // 4. Procesamiento en lote con bucle for...of (secuencial, respetando cuotas de API)
-    const processedResults = [];
-    let successCount = 0;
-    let failureCount = 0;
-    const batchStartTime = Date.now();
-
-    for (let index = 0; index < filesToProcess.length; index++) {
-      // Protección contra timeout HTTP (Cloud Run corta a 60s; paramos a los 35s y devolvemos lo procesado)
-      if (Date.now() - batchStartTime > 35000 && successCount > 0) {
-        console.warn(`[Batch Loop] Límite de seguridad de tiempo alcanzado (35s). Se devuelven ${successCount} comprobantes procesados con éxito.`);
-        break;
-      }
-
-      const file = filesToProcess[index];
-      let fileName = file.name || `archivo_${index + 1}`;
-      const cleanFileNameLower = fileName.trim().toLowerCase();
-      const baseNameLower = cleanFileNameLower.replace(/\.[a-z0-9]+$/i, '');
-
-      // Comprobación anti-duplicado inmediata por archivo antes de consultar la IA
-      if (
-        (file.id && existingFileIds.has(file.id)) ||
-        existingFileNames.has(cleanFileNameLower) ||
-        existingFileNames.has(baseNameLower)
-      ) {
-        console.log(`[Batch Loop] Omitiendo "${fileName}" porque ya se encuentra registrada en la hoja de cálculo.`);
-        processedResults.push({
-          fileId: file.id,
-          fileName,
-          status: 'skipped_duplicate',
-          message: 'Factura repetida: ya se encuentra registrada en la hoja de cálculo. Omitida para evitar doble facturación.',
-        });
-        continue;
-      }
-
-      console.log(`[Batch Loop] (${index + 1}/${filesToProcess.length}) Procesando archivo "${fileName}" (ID: ${file.id})...`);
-
-      try {
-        // Descarga directa del archivo binario desde Google Drive API
         const downloaded = await downloadDriveFileBuffer(drive, file.id!, file.mimeType, fileName);
-        const fileBuffer = downloaded.buffer;
-        const base64Data = fileBuffer.toString('base64');
-        const fileMime = downloaded.mimeType;
         fileName = downloaded.fileName || fileName;
-
-        let extracted: any;
-
-        // Si es Excel / CSV, podemos leer las celdas de forma estructurada
-        if (
-          fileName.toLowerCase().endsWith('.xlsx') ||
-          fileName.toLowerCase().endsWith('.xls') ||
-          fileName.toLowerCase().endsWith('.csv')
-        ) {
-          try {
-            const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
-            const firstSheet = workbook.SheetNames[0];
-            const rawGrid: any[][] = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheet], { header: 1 });
-            const sampleText = rawGrid.slice(0, 40).map((r) => r.join(' | ')).join('\n');
-
-            const contentParts = [
-              { text: `Contenido de la hoja de cálculo (${fileName}):\n\n${sampleText}` },
-              'Extrae los datos contables de esta factura según el esquema JSON estricto.',
-            ];
-
-            const resAi = await callGeminiWithRetry(
-              ai,
-              contentParts,
-              {
-                responseMimeType: 'application/json',
-                responseSchema: INVOICE_EXTRACTION_SCHEMA,
-                systemInstruction: STRICT_SYSTEM_INSTRUCTION,
-                temperature: 0.1,
-              },
-              `Extracción XLSX (${fileName})`
-            );
-
-            if (resAi.success && resAi.text) {
-              const rawJson = resAi.text.trim().replace(/^```json/i, '').replace(/```$/i, '').trim();
-              extracted = JSON.parse(rawJson);
-            }
-          } catch (xlsxErr) {
-            console.warn(`[Batch Loop] Error parseando XLSX para "${fileName}", recurriendo a extracción estándar:`, xlsxErr);
-          }
-        }
-
-        // Si es PDF o imagen (o fallback): extracción multimodal con Gemini
-        if (!extracted) {
-          extracted = await extractInvoiceWithStructuredOutput(ai, base64Data, fileMime, fileName);
-        }
-
-        // Validación anti-duplicado secundaria basada en número de factura y proveedor/total
-        const invNum = (extracted.numeroFactura || extracted.invoiceNumber || '').trim().toLowerCase();
-        const clientNorm = (extracted.cliente || extracted.vendorName || '').trim().toLowerCase();
-        const totStr = String(extracted.total || extracted.totalAmount || 0).trim();
-        const compKey1 = invNum && invNum !== 's/n' && clientNorm ? `${clientNorm}__${invNum}` : '';
-        const compKey2 = clientNorm && totStr && totStr !== '0' ? `${clientNorm}__${totStr}` : '';
-
-        if ((compKey1 && existingInvoiceKeys.has(compKey1)) || (compKey2 && existingInvoiceKeys.has(compKey2))) {
-          console.log(`[Batch Loop] Omitiendo "${fileName}" por coincidencia exacta con factura registrada previamente.`);
-          processedResults.push({
-            fileId: file.id,
-            fileName,
-            status: 'skipped_duplicate',
-            message: `Factura repetida: N° ${extracted.numeroFactura || 'S/N'} de "${extracted.cliente || 'Proveedor'}". No se puede facturar nuevamente.`,
-            extracted,
-          });
-          continue;
-        }
-
-        // Mapear los valores del JSON al formato de columnas por defecto respetando fidelidad total (sin inventar datos)
-        const itemsUnidos = (extracted.items || [])
-          .map((item: any) => {
-            const desc = item.descripcion || item.description || '';
-            const qty = item.cantidad ?? item.quantity;
-            const price = item.precioUnitario ?? item.unitPrice;
-            const tot = item.total;
-            return qty && price ? `${desc} (${qty} x ${price})` : `${desc} (${tot})`;
-          })
-          .filter(Boolean)
-          .join('; ') || (extracted.concepto || '');
-
-        const rowValues = [
-          extracted.fecha || extracted.date || '',                                    // Columna A = Fecha
-          extracted.cliente || extracted.vendorName || '',                            // Columna B = Cliente / Proveedor
-          extracted.nitRut || extracted.vendorTaxId || '',                            // Columna C = NIT / RUT
-          itemsUnidos,                                                                // Columna D = Conceptos / Items unidos
-          extracted.subtotal || 0,                                                    // Columna E = Subtotal
-          extracted.iva ?? extracted.taxAmount ?? 0,                                  // Columna F = IVA
-          extracted.total || extracted.totalAmount || 0,                              // Columna G = Total
-          extracted.moneda || extracted.currency || 'COP',                            // Columna H = Moneda
-          fileName,                                                                   // Columna I = Nombre Archivo
-          file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`,       // Columna J = Enlace Drive
-        ];
-
-        // Inyección automática como fila nueva en Google Sheets (sheets.spreadsheets.values.append)
-        if (targetSpreadsheetId) {
-          await sheets.spreadsheets.values.append({
-            spreadsheetId: targetSpreadsheetId,
-            range: `'${targetSheetTitle.replace(/'/g, "''")}'!A:J`,
-            valueInputOption: 'USER_ENTERED',
-            insertDataOption: 'INSERT_ROWS',
-            requestBody: {
-              values: [rowValues],
-            },
-          });
-          console.log(`[Batch Loop] Fila registrada exitosamente en Google Sheets para "${fileName}".`);
-        }
-
-        // Registrar en índices de duplicados para evitar repeticiones dentro del mismo lote
-        if (file.id) existingFileIds.add(file.id);
-        existingFileNames.add(cleanFileNameLower);
-        existingFileNames.add(baseNameLower);
-        if (compKey1) existingInvoiceKeys.add(compKey1);
-        if (compKey2) existingInvoiceKeys.add(compKey2);
-
-        successCount++;
-        processedResults.push({
-          fileId: file.id,
+        const result = await extractInvoice({
+          base64: downloaded.buffer.toString('base64'),
+          mimeType: downloaded.mimeType,
           fileName,
-          status: 'success',
-          extracted,
-          mappedRow: rowValues,
         });
+        const extracted = result.data;
 
-        // Pausa ligera para respetar cuota por minuto
-        await new Promise((resolve) => setTimeout(resolve, 400));
+        const dupReason = dupIndex.checkInvoice(extracted);
+        if (dupReason) {
+          return { fileId: file.id, fileName, status: 'skipped_duplicate', message: `Factura repetida: ${dupReason}`, extracted };
+        }
+        dupIndex.add(file.id, fileName, extracted);
+
+        const driveUrl = file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`;
+        await appendRowWithLayout(sheets, layout, extracted, driveUrl, fileName);
+        return { fileId: file.id, fileName, status: 'success', reviewStatus: result.status, reasons: result.reasons, extracted };
       } catch (fileError: any) {
-        failureCount++;
-        console.error(`[Batch Loop] Error procesando "${fileName}":`, fileError?.message || fileError);
-        processedResults.push({
-          fileId: file.id,
-          fileName,
-          status: 'error',
-          error: fileError?.message || String(fileError),
-        });
-
-        await new Promise((resolve) => setTimeout(resolve, 600));
+        console.warn(`[Carpeta] Error en "${fileName}": ${fileError?.message || fileError}`);
+        return { fileId: file.id, fileName, status: 'error', error: fileError?.message || String(fileError) };
       }
-    }
+    });
 
-    const remainingFiles = supportedFiles.length - filesToProcess.length;
-    let finishMessage = `Procesamiento completado: ${successCount} facturas registradas en Sheets.`;
-    if (remainingFiles > 0) {
-      finishMessage += ` (Quedan ${remainingFiles} comprobantes por procesar en este lote)`;
-    }
+    const results = [
+      ...skippedUpfront.map((f) => ({
+        fileId: f.id,
+        fileName: f.name,
+        status: 'skipped_duplicate',
+        message: `Factura repetida: ${dupIndex.checkFile(f.id, f.name)}`,
+      })),
+      ...processed,
+    ];
+    const successCount = processed.filter((r) => r.status === 'success').length;
+    const failureCount = processed.filter((r) => r.status === 'error').length;
+    const deferred = processed.filter((r) => r.status === 'deferred').length;
+    const remainingCount = pending.length - filesToProcess.length + deferred;
+
+    let message = `Procesamiento completado: ${successCount} facturas registradas en Sheets.`;
+    if (remainingCount > 0) message += ` Quedan ${remainingCount} comprobantes por procesar.`;
 
     return res.json({
       success: true,
-      message: finishMessage,
+      message,
       folderId,
       spreadsheetId: targetSpreadsheetId,
-      spreadsheetUrl: targetSpreadsheetId
-        ? `https://docs.google.com/spreadsheets/d/${targetSpreadsheetId}/edit`
-        : undefined,
-      sheetTitle: targetSheetTitle,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${targetSpreadsheetId}/edit`,
+      sheetTitle: layout.tab,
       totalFilesInFolder: allFiles.length,
       supportedFilesCount: supportedFiles.length,
-      processedThisBatch: filesToProcess.length,
-      remainingCount: Math.max(0, remainingFiles),
+      processedThisBatch: filesToProcess.length - deferred,
+      remainingCount,
       successCount,
       failureCount,
-      results: processedResults,
+      results,
     });
   } catch (error: any) {
-    return handleGoogleApiError(res, 'Error crítico en /api/process-folder', error);
+    return handleGoogleApiError(res, 'Error al procesar la carpeta', error);
   }
 });
 
@@ -1544,7 +623,7 @@ app.post('/api/process-folder', async (req, res) => {
  */
 app.post('/api/process-drive-file', async (req, res) => {
   try {
-    const { fileId, fileName, mimeType, folderId, spreadsheetId, sheetName = 'Facturas Registradas', skipAppend, model } = req.body;
+    const { fileId, fileName, mimeType, folderId, spreadsheetId, sheetName, skipAppend, model } = req.body;
     const token = extractOAuthToken(req);
 
     if (!token) {
@@ -1554,19 +633,13 @@ app.post('/api/process-drive-file', async (req, res) => {
         error: 'Se requiere token de autenticación OAuth de Google válido. Por favor inicia sesión o renueva tu conexión.',
       });
     }
-
     if (!fileId) {
-      return res.status(400).json({
-        success: false,
-        error: 'El parámetro "fileId" es obligatorio.',
-      });
+      return res.status(400).json({ success: false, error: 'El parámetro "fileId" es obligatorio.' });
     }
-
-    const ai = getGenAI();
-    if (!ai) {
+    if (!getGenAI()) {
       return res.status(500).json({
         success: false,
-        error: 'GEMINI_API_KEY no está configurada en el servidor.',
+        error: 'GEMINI_API_KEY no está configurada en el servidor. Añádela al archivo .env y reinicia.',
       });
     }
 
@@ -1575,169 +648,55 @@ app.post('/api/process-drive-file', async (req, res) => {
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
-    // 1. Descargar archivo binario de Drive
-    const downloaded = await downloadDriveFileBuffer(drive, fileId, mimeType, fileName);
-    const fileBuffer = downloaded.buffer;
-    const base64Data = fileBuffer.toString('base64');
-    const safeMime = downloaded.mimeType;
-    const safeName = downloaded.fileName;
-
-    // 2. Extraer datos estructurados
-    let extracted: any;
-    if (
-      safeName.toLowerCase().endsWith('.xlsx') ||
-      safeName.toLowerCase().endsWith('.xls') ||
-      safeName.toLowerCase().endsWith('.csv')
-    ) {
-      try {
-        const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
-        const firstSheet = workbook.SheetNames[0];
-        const rawGrid: any[][] = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheet], { header: 1 });
-        const sampleText = rawGrid.slice(0, 40).map((r) => r.join(' | ')).join('\n');
-
-        const contentParts = [
-          { text: `Contenido de la hoja de cálculo (${safeName}):\n\n${sampleText}` },
-          'Extrae los datos contables de esta factura según el esquema JSON estricto.',
-        ];
-
-        const resAi = await callGeminiWithRetry(
-          ai,
-          contentParts,
-          {
-            responseMimeType: 'application/json',
-            responseSchema: INVOICE_EXTRACTION_SCHEMA,
-            systemInstruction: STRICT_SYSTEM_INSTRUCTION,
-            temperature: 0.1,
-          },
-          `Extracción XLSX (${safeName})`
-        );
-
-        if (resAi.success && resAi.text) {
-          const rawJson = resAi.text.trim().replace(/^```json/i, '').replace(/```$/i, '').trim();
-          extracted = JSON.parse(rawJson);
-        }
-      } catch (xlsxErr) {
-        console.warn(`Aviso parseando XLSX para ${safeName}:`, xlsxErr);
-      }
-    }
-
-    if (!extracted) {
-      extracted = await extractInvoiceWithStructuredOutput(ai, base64Data, safeMime, safeName, model);
-    }
-
-    // 3. Resolver hoja de cálculo si no viene especificada y verificar pestaña real
-    let targetSpreadsheetId = spreadsheetId;
-    let targetSheetTitle = sheetName || 'Facturas Registradas';
-
+    // 1. Hoja de destino (la indicada o la primera hoja de cálculo de la carpeta).
+    //    Se resuelve y se lee una sola vez por lote (caché de unos minutos compartida entre peticiones).
+    let targetSpreadsheetId: string | null | undefined = spreadsheetId;
     if (!targetSpreadsheetId && folderId) {
-      const folderFiles = await drive.files.list({
-        q: `'${folderId}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'`,
-        fields: 'files(id, name)',
-        pageSize: 1,
-      }).catch(() => ({ data: { files: [] } }));
-
-      if (folderFiles.data.files && folderFiles.data.files.length > 0) {
-        targetSpreadsheetId = folderFiles.data.files[0].id;
-      }
+      targetSpreadsheetId = await findFolderSpreadsheet(drive, token, folderId);
     }
-
-    if (targetSpreadsheetId) {
-      try {
-        const meta = await sheets.spreadsheets.get({
-          spreadsheetId: targetSpreadsheetId,
-          fields: 'sheets.properties.title',
-        });
-        const sheetList = meta.data.sheets || [];
-        const matched = sheetList.find((s: any) => s.properties?.title?.toLowerCase() === targetSheetTitle.toLowerCase());
-        if (matched && matched.properties?.title) {
-          targetSheetTitle = matched.properties.title;
-        } else if (sheetList.length > 0 && sheetList[0].properties?.title) {
-          targetSheetTitle = sheetList[0].properties.title;
-        }
-      } catch (metaErr) {
-        console.warn('[Process File] Aviso al consultar metadata de la hoja:', metaErr);
-      }
-    }
-
-    // 4. Si se tiene spreadsheetId, verificar si la factura ya está registrada para evitar duplicados
-    const itemsUnidos = (extracted.items || [])
-      .map((item: any) => {
-        const desc = item.descripcion || item.description || '';
-        const qty = item.cantidad ?? item.quantity;
-        const price = item.precioUnitario ?? item.unitPrice;
-        const tot = item.total;
-        return qty && price ? `${desc} (${qty} x ${price})` : `${desc} (${tot})`;
-      })
-      .filter(Boolean)
-      .join('; ') || (extracted.concepto || '');
-
+    const session = targetSpreadsheetId ? await getSheetSession(sheets, token, targetSpreadsheetId, sheetName) : null;
+    const layout = session?.layout ?? null;
+    const dupIndex = session?.dupIndex ?? null;
     const fileViewUrl = `https://drive.google.com/file/d/${fileId}/view`;
-    const docHyperlinkFormula = `=HYPERLINK("${fileViewUrl}", "${safeName.replace(/"/g, '""')}")`;
 
-    // Adjuntar enlace directo de Google Drive a los datos extraídos
-    extracted.driveUrl = fileViewUrl;
-    extracted.webViewLink = fileViewUrl;
-    extracted.fileId = fileId;
-    extracted.fileName = safeName;
-
-    const rowValues = [
-      extracted.fecha || extracted.date || '',
-      extracted.cliente || extracted.vendorName || '',
-      extracted.nitRut || extracted.vendorTaxId || '',
-      itemsUnidos,
-      extracted.categoria || extracted.category || '',
-      extracted.subtotal || 0,
-      extracted.iva ?? extracted.taxAmount ?? 0,
-      extracted.total || extracted.totalAmount || 0,
-      docHyperlinkFormula,
-    ];
-
-    let isDuplicate = false;
-    let duplicateReason = '';
-
-    if (targetSpreadsheetId) {
-      try {
-        const existingData = await sheets.spreadsheets.values.get({
-          spreadsheetId: targetSpreadsheetId,
-          range: `'${targetSheetTitle.replace(/'/g, "''")}'!A2:I500`,
-        });
-        const rows = existingData.data.values || [];
-        const safeNameNorm = safeName.trim().toLowerCase();
-        const safeBaseNorm = safeNameNorm.replace(/\.[a-z0-9]+$/i, '');
-        const invNumNorm = (extracted.numeroFactura || extracted.invoiceNumber || '').trim().toLowerCase();
-        const vendorNorm = (extracted.cliente || extracted.vendorName || '').trim().toLowerCase();
-
-        for (const r of rows) {
-          const rLink = String(r[8] || '');
-          const rClient = String(r[1] || '').trim().toLowerCase();
-          const rConcept = String(r[3] || '').trim().toLowerCase();
-
-          if (rLink.includes(fileId)) {
-            isDuplicate = true;
-            duplicateReason = 'El archivo ya se encuentra vinculado en la hoja de cálculo.';
-            break;
-          }
-          if (rLink.toLowerCase().includes(safeNameNorm) || (safeBaseNorm.length > 3 && rLink.toLowerCase().includes(safeBaseNorm))) {
-            isDuplicate = true;
-            duplicateReason = `Ya existe un registro con el archivo "${safeName}".`;
-            break;
-          }
-          if (invNumNorm && invNumNorm !== 's/n' && vendorNorm && rClient && rClient === vendorNorm && rConcept.includes(invNumNorm)) {
-            isDuplicate = true;
-            duplicateReason = `La factura N° ${extracted.numeroFactura} de "${extracted.cliente}" ya está registrada.`;
-            break;
-          }
-        }
-      } catch (checkErr) {
-        console.warn('[Process File] Aviso al comprobar duplicados en Sheets:', checkErr);
-      }
-    }
-
-    if (isDuplicate) {
+    // 2. Si el archivo ya está en la hoja, no gastar una lectura de IA
+    const fileDup = dupIndex?.checkFile(fileId, fileName);
+    if (fileDup) {
       return res.json({
         success: true,
         isDuplicate: true,
-        message: `Factura repetida: ${duplicateReason} Omitida para evitar doble facturación.`,
+        message: `Factura repetida: ${fileDup} Omitida para evitar doble facturación.`,
+        fileId,
+        fileName,
+        driveUrl: fileViewUrl,
+        spreadsheetId: targetSpreadsheetId,
+      });
+    }
+
+    // 3. Descargar y leer con IA
+    const downloaded = await downloadDriveFileBuffer(drive, fileId, mimeType, fileName);
+    const safeName = downloaded.fileName;
+    const result = await extractInvoice({
+      base64: downloaded.buffer.toString('base64'),
+      mimeType: downloaded.mimeType,
+      fileName: safeName,
+      preferredModel: model,
+    });
+    const extracted: any = {
+      ...result.data,
+      status: result.status,
+      driveUrl: fileViewUrl,
+      webViewLink: fileViewUrl,
+      fileId,
+      fileName: safeName,
+    };
+
+    const invoiceDup = dupIndex?.checkInvoice(extracted);
+    if (invoiceDup) {
+      return res.json({
+        success: true,
+        isDuplicate: true,
+        message: `Factura repetida: ${invoiceDup} Omitida para evitar doble facturación.`,
         fileId,
         fileName: safeName,
         driveUrl: fileViewUrl,
@@ -1746,14 +705,16 @@ app.post('/api/process-drive-file', async (req, res) => {
       });
     }
 
-    if (targetSpreadsheetId && !skipAppend) {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: targetSpreadsheetId,
-        range: `'${targetSheetTitle.replace(/'/g, "''")}'!A:I`,
-        valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: [rowValues] },
-      }).catch((e) => console.warn('Aviso insertando fila individual en Sheets:', e?.message));
+    let sheetAppended = false;
+    if (layout && !skipAppend) {
+      try {
+        await appendRowWithLayout(sheets, layout, extracted, fileViewUrl, safeName);
+        dupIndex?.add(fileId, safeName, extracted);
+        sheetAppended = true;
+      } catch (appendErr: any) {
+        invalidateSheetSession(token, targetSpreadsheetId!, sheetName);
+        throw appendErr;
+      }
     }
 
     return res.json({
@@ -1762,13 +723,48 @@ app.post('/api/process-drive-file', async (req, res) => {
       fileName: safeName,
       driveUrl: fileViewUrl,
       extracted,
+      sheetAppended,
+      reviewStatus: result.status,
+      reasons: result.reasons,
       spreadsheetId: targetSpreadsheetId,
       spreadsheetUrl: targetSpreadsheetId ? `https://docs.google.com/spreadsheets/d/${targetSpreadsheetId}/edit` : undefined,
     });
   } catch (err: any) {
-    return handleGoogleApiError(res, 'Error al procesar archivo de Drive', err);
+    const name = req.body?.fileName || req.body?.fileId;
+    if (err instanceof InvoiceExtractionError) {
+      const transient = isTransientError(err.cause);
+      console.error(`[process-drive-file] ${name}: ${err.message}`);
+      return res
+        .status(transient ? 429 : 422)
+        .json({ success: false, isQuota: transient, isDailyQuota: isDailyQuotaError(err), error: err.message });
+    }
+    console.error(`[process-drive-file] ${name}: ${err?.message || err}`);
+    return handleGoogleApiError(res, `Error al procesar "${name}"`, err);
   }
 });
+
+// Carpeta de Drive → primera hoja de cálculo que contiene (en caché unos minutos por usuario)
+const folderSheetCache = new Map<string, { expires: number; id: string | null }>();
+async function findFolderSpreadsheet(drive: any, token: string, folderId: string): Promise<string | null> {
+  const key = `${token.slice(-24)}|${folderId}`;
+  const hit = folderSheetCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.id;
+  const found = await withGoogleRetry(
+    () =>
+      drive.files.list({
+        q: `'${folderId}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'`,
+        fields: 'files(id, name)',
+        orderBy: 'createdTime',
+        pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      }),
+    'Drive buscar hoja'
+  ).catch(() => null);
+  const id: string | null = (found as any)?.data?.files?.[0]?.id ?? null;
+  folderSheetCache.set(key, { expires: Date.now() + 5 * 60 * 1000, id });
+  return id;
+}
 
 /**
  * Endpoint: POST /api/append-invoice-row

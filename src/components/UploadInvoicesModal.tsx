@@ -30,7 +30,8 @@ interface UploadInvoicesModalProps {
   onClose: () => void;
   project: ProjectFolder;
   accessToken?: string;
-  onInvoiceCompleted?: () => void;
+  /** Recibe las facturas ya leídas (no duplicadas) de esta obra; se llama al abrir y cuando hay nuevas. */
+  onInvoiceCompleted?: (readJobs: BackendInvoiceJob[]) => void;
 }
 
 interface LocalFileQueueItem {
@@ -59,11 +60,24 @@ export const UploadInvoicesModal: React.FC<UploadInvoicesModalProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
 
+  // Trabajos ya registrados en Sheets que la página ya conoce (para recargarla solo con novedades)
+  const appendedJobIdsRef = useRef<Set<string> | null>(null);
+
   // Cargar trabajos de esta obra y configurar polling cada 3s (Requisito 2.e)
   const loadJobs = async () => {
     if (!project?.id) return;
     const jobs = await fetchProjectJobs(project.id);
     setBackendJobs(jobs);
+
+    // Leídas por la IA y no repetidas (estén o no ya escritas en Sheets)
+    const readJobs = jobs.filter(
+      (j) => (j.status === 'leida' || j.status === 'revisar') && !j.isDuplicate && !j.isPossibleDuplicate
+    );
+    const isFirstLoad = appendedJobIdsRef.current === null;
+    if (isFirstLoad) appendedJobIdsRef.current = new Set();
+    const hasNew = readJobs.some((j) => !appendedJobIdsRef.current!.has(j.id));
+    readJobs.forEach((j) => appendedJobIdsRef.current!.add(j.id));
+    if (hasNew) onInvoiceCompleted?.(readJobs);
   };
 
   useEffect(() => {
@@ -390,7 +404,8 @@ export const UploadInvoicesModal: React.FC<UploadInvoicesModalProps> = ({
                       </div>
                       {job.extractedData && (
                         <p className="text-[11px] text-slate-500 mt-0.5 truncate">
-                          {job.extractedData.proveedor} • {formatCOP(job.extractedData.total)}
+                          {job.extractedData.proveedor || 'Proveedor sin identificar'} • Nº {job.extractedData.numero_factura} •{' '}
+                          {job.extractedData.fecha} • <span className="font-semibold text-slate-700">{formatCOP(job.extractedData.total)}</span>
                         </p>
                       )}
                     </div>
@@ -407,6 +422,20 @@ export const UploadInvoicesModal: React.FC<UploadInvoicesModalProps> = ({
                     <div className="p-2 bg-amber-50 rounded-lg border border-amber-200 text-[11px] text-amber-900 flex items-start gap-1.5">
                       <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
                       <span>{job.duplicateReason}</span>
+                    </div>
+                  )}
+
+                  {job.status === 'revisar' && job.extractedData?.reasons?.length > 0 && (
+                    <ul className="p-2 bg-amber-50 rounded-lg border border-amber-200 text-[11px] text-amber-900 list-disc pl-6 space-y-0.5">
+                      {job.extractedData.reasons.map((r: string, i: number) => (
+                        <li key={i}>{r}</li>
+                      ))}
+                    </ul>
+                  )}
+
+                  {job.sheetError && (
+                    <div className="p-2 bg-rose-50 rounded-lg border border-rose-200 text-[11px] text-rose-800">
+                      {job.sheetError}
                     </div>
                   )}
 

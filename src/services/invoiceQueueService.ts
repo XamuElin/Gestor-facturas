@@ -24,6 +24,8 @@ export interface BackendInvoiceJob {
   duplicateReason?: string;
   extractedData?: any;
   sheetAppended?: boolean;
+  sheetError?: string;
+  modelUsed?: string;
   durationMs?: number;
   createdAt: number;
   updatedAt: number;
@@ -71,21 +73,21 @@ export async function uploadAndEnqueueInvoice(params: {
   try {
     onProgress?.(10, 'Comprimiendo imagen...');
 
-    // 1. Compresión en cliente: imágenes max 1600px lado mayor y JPEG 0.8; PDF tal cual
+    // 1. Compresión en cliente: imágenes máx. 2400 px y JPEG 0.85 (legible para cifras pequeñas); PDF tal cual
     let base64ToSend: string;
     let mimeToSend = file.type || 'image/jpeg';
 
     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
-      const buffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      base64ToSend = btoa(binary);
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+      base64ToSend = dataUrl.replace(/^data:[^;]+;base64,/, '');
       mimeToSend = 'application/pdf';
     } else {
-      const optimized = await optimizeImageForAnalysis(file, 1600, 0.8);
+      const optimized = await optimizeImageForAnalysis(file, 2400, 0.85);
       base64ToSend = optimized.base64.replace(/^data:[^;]+;base64,/, '');
       mimeToSend = optimized.mimeType;
     }
