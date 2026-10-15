@@ -1,0 +1,38 @@
+{
+  "id": "/",
+  "name": "Gestor de Facturas de Obra - SVH",
+  "short_name": "Facturas SVH",
+  "description": "Control, lectura automática con IA y archivo de facturas de obra en Google Drive y Sheets.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0F766E",
+  "background_color": "#F6F7F9",
+  "icons": [
+    {
+      "src": "/svh-logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -766,6 +766,10 @@ async function findFolderSpreadsheet(drive: any, token: string, folderId: string
   return id;
 }
 
+function rememberFolderSpreadsheet(token: string, folderId: string, spreadsheetId: string) {
+  folderSheetCache.set(`${token.slice(-24)}|${folderId}`, { expires: Date.now() + 5 * 60 * 1000, id: spreadsheetId });
+}
+
 /**
  * Endpoint: POST /api/append-invoice-row
  * Inserta de forma segura y robusta una fila en Google Sheets usando el SDK oficial de Google.
@@ -933,8 +937,16 @@ app.post('/api/export-invoices-styled', async (req, res) => {
 
     let targetSpreadsheetId = existingSpreadsheetId;
 
+    // Sin ID: reutilizar la hoja que ya exista en la carpeta (antes se creaba una hoja nueva en cada exportación)
+    const validFolder = folderId && !['root', 'shared-with-me', 'shared-drives'].includes(folderId);
+    if (!targetSpreadsheetId && validFolder) {
+      targetSpreadsheetId = await findFolderSpreadsheet(drive, token, folderId);
+    }
+
     // Si no se proporcionó ID de hoja, crear un nuevo Google Sheet corporativo con el nombre del proyecto más "Facturación"
+    let createdNow = false;
     if (!targetSpreadsheetId) {
+      createdNow = true;
       const baseProject = projectName.replace(/^(Obra:\s*|Proyecto:\s*)/i, '').replace(/[:\/\\?*|"]/g, ' ').trim() || projectName;
       const cleanProj = /facturaci[oó]n/i.test(baseProject) ? baseProject : `${baseProject} Facturación`;
       const createSheetRes = await sheets.spreadsheets.create({
@@ -964,6 +976,7 @@ app.post('/api/export-invoices-styled', async (req, res) => {
         } catch (moveErr) {
           console.warn('Aviso organizando archivo en carpeta de Drive:', moveErr);
         }
+        rememberFolderSpreadsheet(token, folderId, targetSpreadsheetId);
       }
     }
 
@@ -983,6 +996,70 @@ app.post('/api/export-invoices-styled', async (req, res) => {
     const primarySheet = sheetMeta.data.sheets?.[0];
     const targetSheetIdNumber = primarySheet?.properties?.sheetId || 0;
     const activeTabTitle = primarySheet?.properties?.title || sheetTitle;
+    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${targetSpreadsheetId}/edit`;
+    const spreadsheetName = `Control Facturas SVH - ${projectName.replace(/[:\/\\?*|"]/g, '_')}`;
+
+    // Campos de cualquier origen (lote de Drive, factura individual o registros leídos de la hoja)
+    const normalizeInvoice = (inv: any) => ({
+      date: inv.fecha || inv.date || inv.issueDate || '',
+      vendorName: inv.cliente || inv.vendorName || '',
+      vendorTaxId: inv.nitRut || inv.vendorTaxId || '',
+      concept: inv.concepto || inv.concept || '',
+      category: inv.categoria || inv.category || 'Materiales',
+      invoiceNumber: inv.numeroFactura || inv.invoiceNumber || '',
+      subtotal: Number(inv.subtotal ?? 0) || 0,
+      taxAmount: Number(inv.iva ?? inv.taxAmount ?? 0) || 0,
+      totalAmount: Number(inv.total ?? inv.totalAmount ?? 0) || 0,
+      fileName: inv.fileName || inv.name || '',
+      driveUrl: inv.driveUrl || inv.webViewLink || inv.driveFileUrl || '',
+    });
+
+    // Hoja que ya tiene contenido: AÑADIR filas respetando sus columnas, sin sobrescribir ni duplicar
+    if (!createdNow) {
+      const top = await withGoogleRetry(
+        () =>
+          sheets.spreadsheets.values.get({
+            spreadsheetId: targetSpreadsheetId,
+            range: `'${activeTabTitle.replace(/'/g, "''")}'!A1:Z6`,
+            valueRenderOption: 'FORMULA',
+          }),
+        'Sheets comprobar contenido'
+      );
+      const hasContent = (top.data.values || []).some((r) => (r || []).some((c) => String(c ?? '').trim() !== ''));
+      if (hasContent) {
+        const session = await getSheetSession(sheets, token, targetSpreadsheetId, activeTabTitle);
+        let appended = 0;
+        let skipped = 0;
+        for (const raw of invoices || []) {
+          const inv = normalizeInvoice(raw);
+          const fileId = inv.driveUrl.match(/\/d\/([a-zA-Z0-9_-]{10,})|[?&]id=([a-zA-Z0-9_-]{10,})/);
+          const id = fileId ? fileId[1] || fileId[2] : null;
+          if (session.dupIndex.checkFile(id, inv.fileName) || session.dupIndex.checkInvoice(inv)) {
+            skipped++;
+            continue;
+          }
+          try {
+            await appendRowWithLayout(sheets, session.layout, inv, inv.driveUrl, inv.fileName);
+          } catch (appendErr) {
+            invalidateSheetSession(token, targetSpreadsheetId, activeTabTitle);
+            throw appendErr;
+          }
+          session.dupIndex.add(id, inv.fileName, inv);
+          appended++;
+        }
+        return res.json({
+          success: true,
+          message: `${appended} factura(s) añadidas a la hoja existente${skipped ? ` (${skipped} ya estaban registradas)` : ''}.`,
+          spreadsheetId: targetSpreadsheetId,
+          spreadsheetUrl,
+          spreadsheetName,
+          folderId,
+          projectName,
+          rowsCount: appended,
+          skippedCount: skipped,
+        });
+      }
+    }
 
     // 1. Limpiar o asegurar que la hoja esté lista para el diseño ejecutivo
     // Escribir la fórmula del Logo en A1 y los encabezados en la Fila 4 (A4:I4)
@@ -1021,18 +1098,19 @@ app.post('/api/export-invoices-styled', async (req, res) => {
     }
 
     // Preparar filas de datos (a partir de la fila 5) con enlaces cliqueables =HYPERLINK()
-    const dataRows = (invoices || []).map((inv: any) => {
-      const fecha = inv.fecha || inv.date || new Date().toISOString().split('T')[0];
-      const cliente = inv.cliente || inv.vendorName || 'Sin especificar';
-      const nitRut = inv.nitRut || inv.vendorTaxId || '';
-      const concepto = inv.concepto || inv.concept || 'Factura de obra';
-      const categoria = inv.categoria || inv.category || 'Materiales';
-      const subtotal = Number(inv.subtotal ?? 0);
-      const iva = Number(inv.iva ?? inv.taxAmount ?? 0);
-      const total = Number(inv.total ?? inv.totalAmount ?? 0);
+    const dataRows = (invoices || []).map((raw: any) => {
+      const inv = normalizeInvoice(raw);
+      const fecha = inv.date || new Date().toISOString().split('T')[0];
+      const cliente = inv.vendorName || 'Sin especificar';
+      const nitRut = inv.vendorTaxId;
+      const concepto = inv.concept || 'Factura de obra';
+      const categoria = inv.category;
+      const subtotal = inv.subtotal;
+      const iva = inv.taxAmount;
+      const total = inv.totalAmount;
 
-      const rawFileName = inv.fileName || inv.name || 'Comprobante.pdf';
-      let resolvedLink = inv.driveUrl || inv.webViewLink;
+      const rawFileName = inv.fileName || 'Comprobante.pdf';
+      let resolvedLink = inv.driveUrl;
       if (!resolvedLink && rawFileName) {
         resolvedLink =
           driveFileMap.get(rawFileName.toLowerCase().trim()) ||
@@ -1302,14 +1380,14 @@ app.post('/api/export-invoices-styled', async (req, res) => {
       console.log('[Batch Sheets] Banding opcional ya configurado o omitido.');
     }
 
-    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${targetSpreadsheetId}/edit`;
+    invalidateSheetSession(token, targetSpreadsheetId, activeTabTitle);
 
     return res.json({
       success: true,
       message: 'Facturas exportadas exitosamente a Google Sheets con diseño corporativo SVH.',
       spreadsheetId: targetSpreadsheetId,
       spreadsheetUrl,
-      spreadsheetName: `Control Facturas SVH - ${projectName.replace(/[:\/\\?*|"]/g, '_')}`,
+      spreadsheetName,
       folderId,
       projectName,
       rowsCount: dataRows.length,
